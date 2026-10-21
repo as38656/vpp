@@ -212,6 +212,9 @@ typedef struct
   /* mac address */
   u8 *default_mac_address;
 
+  /* multicast filter list, given to the PMD as a whole */
+  struct rte_ether_addr *mc_addrs;
+
   /* maximum supported max frame size */
   u32 max_supported_frame_size;
 
