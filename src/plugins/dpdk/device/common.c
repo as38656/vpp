@@ -460,6 +460,15 @@ dpdk_device_start (dpdk_device_t * xd)
   if (rv)
     dpdk_device_error (xd, "rte_eth_dev_default_mac_addr_set", rv);
 
+  /* A VF reset on start (ixgbevf) clears the list in the PF. */
+  if (vec_len (xd->mc_addrs))
+    {
+      rv = rte_eth_dev_set_mc_addr_list (xd->port_id, xd->mc_addrs,
+					 vec_len (xd->mc_addrs));
+      if (rv)
+	dpdk_device_error (xd, "rte_eth_dev_set_mc_addr_list", rv);
+    }
+
   if (xd->flags & DPDK_DEVICE_FLAG_PROMISC)
     rte_eth_promiscuous_enable (xd->port_id);
   else

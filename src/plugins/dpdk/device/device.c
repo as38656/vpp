@@ -32,6 +32,43 @@ static char *dpdk_tx_func_error_strings[] = {
 #undef _
 };
 
+/* DPDK filters multicast through one list per port. Some PMDs (ixgbevf, for
+ * one) refuse multicast addresses in rte_eth_dev_mac_addr_add, and an
+ * untrusted VF cannot use all-multicast, so ND would not work there. */
+static clib_error_t *
+dpdk_add_del_mc_address (dpdk_device_t *xd, const u8 *address, u8 is_add)
+{
+  struct rte_ether_addr *addr = (struct rte_ether_addr *) address;
+  struct rte_ether_addr *mc_addrs;
+  u32 i, n_addrs = vec_len (xd->mc_addrs);
+  int rv;
+
+  for (i = 0; i < n_addrs; i++)
+    if (rte_is_same_ether_addr (&xd->mc_addrs[i], addr))
+      break;
+
+  if (is_add == (i < n_addrs))
+    return NULL;
+
+  mc_addrs = vec_dup (xd->mc_addrs);
+  if (is_add)
+    vec_add1 (mc_addrs, *addr);
+  else
+    vec_del1 (mc_addrs, i);
+
+  rv = rte_eth_dev_set_mc_addr_list (xd->port_id, mc_addrs, vec_len (mc_addrs));
+  if (rv)
+    {
+      vec_free (mc_addrs);
+      return clib_error_return (0, "multicast address list update failed: %U",
+				format_dpdk_rte_err, rv);
+    }
+
+  vec_free (xd->mc_addrs);
+  xd->mc_addrs = mc_addrs;
+  return NULL;
+}
+
 static clib_error_t *
 dpdk_add_del_mac_address (vnet_hw_interface_t * hi,
 			  const u8 * address, u8 is_add)
@@ -39,6 +76,9 @@ dpdk_add_del_mac_address (vnet_hw_interface_t * hi,
   int error;
   dpdk_main_t *dm = &dpdk_main;
   dpdk_device_t *xd = vec_elt_at_index (dm->devices, hi->dev_instance);
+
+  if (ethernet_address_cast (address) == ETHERNET_ADDRESS_MULTICAST)
+    return dpdk_add_del_mc_address (xd, address, is_add);
 
   if (is_add)
     error = rte_eth_dev_mac_addr_add (xd->port_id,
