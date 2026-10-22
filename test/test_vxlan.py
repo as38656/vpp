@@ -9,6 +9,7 @@ from template_bd import BridgeDomain
 
 from scapy.layers.l2 import Ether
 from scapy.layers.l2 import ARP
+from scapy.layers.l2 import Dot1AD, Dot1Q
 from scapy.packet import Raw, bind_layers
 from scapy.layers.inet import IP, UDP
 from scapy.layers.inet6 import IPv6
@@ -356,6 +357,25 @@ class TestVxlan(BridgeDomain, VppTestCase):
         )
         encap_frames(frame_mpls6)
 
+        frame_dot1q = (
+            Ether(src="00:00:00:00:00:02", dst="00:00:00:00:00:01")
+            / Dot1Q(vlan=100)
+            / IP(src="4.3.2.1", dst="1.2.3.4")
+            / UDP(sport=20000, dport=10000)
+            / Raw("\xa5" * 100)
+        )
+        encap_frames(frame_dot1q)
+
+        frame_qinq = (
+            Ether(src="00:00:00:00:00:02", dst="00:00:00:00:00:01")
+            / Dot1AD(vlan=200)
+            / Dot1Q(vlan=100)
+            / IPv6(src="2001:db8::4321", dst="2001:db8::1234")
+            / UDP(sport=20000, dport=10000)
+            / Raw("\xa5" * 100)
+        )
+        encap_frames(frame_qinq)
+
     def encap_big_packet(self):
         self.vapi.sw_interface_set_mtu(self.pg0.sw_if_index, [1500, 0, 0, 0])
 
@@ -551,15 +571,22 @@ class TestVxlanL2Mode(VppTestCase):
 
     def tearDown(self):
         super(TestVxlanL2Mode, self).tearDown()
+        for pg in self.pg_interfaces:
+            pg.unconfig_ip4()
+            pg.admin_down()
 
-    def test_l2_mode(self):
-        """VXLAN L2 mode"""
+    def create_tunnel(self):
         t = VppVxlanTunnel(
             self, src=self.pg0.local_ip4, dst=self.pg0.remote_ip4, vni=1000, is_l3=False
         )
         t.add_vpp_config()
         t.config_ip4()
         t.admin_up()
+        return t
+
+    def test_l2_mode(self):
+        """VXLAN L2 mode"""
+        t = self.create_tunnel()
 
         dstIP = t.local_ip4[:-1] + "2"
 
@@ -587,6 +614,30 @@ class TestVxlanL2Mode(VppTestCase):
         p.dst = self.pg1.local_mac
         rx = self.send_and_expect(self.pg1, p * NUM_PKTS, self.pg0)
         self.assertEqual(NUM_PKTS, len(rx))
+
+    def test_l2_mode_flow_hash(self):
+        """VXLAN L2 mode source port follows the routed inner flow"""
+        t = self.create_tunnel()
+
+        dstIP = t.local_ip4[:-1] + "2"
+        VppNeighbor(self, t.sw_if_index, self.pg1.remote_mac, dstIP).add_vpp_config()
+
+        n = 10
+        frames = [
+            Ether(dst=self.pg1.local_mac, src=self.pg1.remote_mac)
+            / IP(src=self.pg1.remote_ip4, dst=dstIP)
+            / UDP(sport=555, dport=556 + i)
+            / Raw(b"\x00" * 80)
+            for i in range(n)
+        ]
+        rx = self.send_and_expect(self.pg1, frames * 2, self.pg0)
+
+        sports = {}
+        for p in rx:
+            sports.setdefault(p[VXLAN][UDP].dport, set()).add(p[UDP].sport)
+        for flow_sports in sports.values():
+            self.assertEqual(len(flow_sports), 1)
+        self.assertGreaterEqual(len(set().union(*sports.values())), 2)
 
 
 class TestVxlanRouting(VppTestCase):

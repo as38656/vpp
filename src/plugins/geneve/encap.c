@@ -107,10 +107,6 @@ geneve_encap_inline (vlib_main_t * vm,
 	  n_left_to_next -= 2;
 	  n_left_from -= 2;
 
-	  flow_hash0 = vnet_l2_compute_flow_hash (b[0]);
-	  flow_hash1 = vnet_l2_compute_flow_hash (b[1]);
-
-
 	  /* Get next node index and adj index from tunnel next_dpo */
 	  if (sw_if_index0 != vnet_buffer (b[0])->sw_if_index[VLIB_TX])
 	    {
@@ -123,6 +119,8 @@ geneve_encap_inline (vlib_main_t * vm,
 
 	  ALWAYS_ASSERT (t0 != NULL);
 
+	  flow_hash0 =
+	    t0->l3_mode ? vnet_l2_compute_frame_flow_hash (b[0]) : vnet_l2_compute_flow_hash (b[0]);
 	  vnet_buffer (b[0])->ip.adj_index[VLIB_TX] = t0->next_dpo.dpoi_index;
 
 	  /* Get next node index and adj index from tunnel next_dpo */
@@ -137,6 +135,8 @@ geneve_encap_inline (vlib_main_t * vm,
 
 	  ALWAYS_ASSERT (t1 != NULL);
 
+	  flow_hash1 =
+	    t1->l3_mode ? vnet_l2_compute_frame_flow_hash (b[1]) : vnet_l2_compute_flow_hash (b[1]);
 	  vnet_buffer (b[1])->ip.adj_index[VLIB_TX] = t1->next_dpo.dpoi_index;
 
 	  /* Apply the rewrite string. $$$$ vnet_rewrite? */
@@ -357,8 +357,6 @@ geneve_encap_inline (vlib_main_t * vm,
 	  n_left_from -= 1;
 	  n_left_to_next -= 1;
 
-	  flow_hash0 = vnet_l2_compute_flow_hash (b[0]);
-
 	  /* Get next node index and adj index from tunnel next_dpo */
 	  if (sw_if_index0 != vnet_buffer (b[0])->sw_if_index[VLIB_TX])
 	    {
@@ -371,6 +369,8 @@ geneve_encap_inline (vlib_main_t * vm,
 
 	  ALWAYS_ASSERT (t0 != NULL);
 
+	  flow_hash0 =
+	    t0->l3_mode ? vnet_l2_compute_frame_flow_hash (b[0]) : vnet_l2_compute_flow_hash (b[0]);
 	  vnet_buffer (b[0])->ip.adj_index[VLIB_TX] = t0->next_dpo.dpoi_index;
 
 	  /* Apply the rewrite string. $$$$ vnet_rewrite? */
