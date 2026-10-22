@@ -60,8 +60,8 @@ dpdk_add_del_mc_address (dpdk_device_t *xd, const u8 *address, u8 is_add)
   if (rv)
     {
       vec_free (mc_addrs);
-      return clib_error_return (0, "multicast address list update failed: %U",
-				format_dpdk_rte_err, rv);
+      return clib_error_return (0, "multicast address list update failed: %U", format_dpdk_rte_err,
+				rv);
     }
 
   vec_free (xd->mc_addrs);
