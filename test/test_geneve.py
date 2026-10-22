@@ -10,10 +10,12 @@ from config import config
 from scapy.layers.l2 import Ether, ARP
 from scapy.layers.inet import IP, UDP, ICMP
 from scapy.contrib.geneve import GENEVE
+from scapy.packet import Raw
 
 import util
 from vpp_ip_route import VppIpRoute, VppRoutePath
 from vpp_ip import INVALID_INDEX
+from vpp_neighbor import VppNeighbor
 
 
 @unittest.skipIf("geneve" in config.excluded_plugins, "Exclude GENEVE plugin tests")
@@ -332,6 +334,53 @@ class TestGeneveL3(VppTestCase):
             remote_address=self.pg0.remote_ip4,
             vni=vni,
         )
+
+    def test_l3_flow_hash(self):
+        """GENEVE L3 mode source port follows the routed inner flow"""
+        vni = 1234
+        r = self.vapi.geneve_add_del_tunnel2(
+            is_add=1,
+            local_address=self.pg0.local_ip4,
+            remote_address=self.pg0.remote_ip4,
+            vni=vni,
+            l3_mode=1,
+        )
+        self.addCleanup(
+            self.vapi.geneve_add_del_tunnel2,
+            is_add=0,
+            local_address=self.pg0.local_ip4,
+            remote_address=self.pg0.remote_ip4,
+            vni=vni,
+        )
+        self.vapi.sw_interface_add_del_address(
+            sw_if_index=r.sw_if_index, prefix="10.0.0.1/24"
+        )
+        self.addCleanup(
+            self.vapi.sw_interface_add_del_address,
+            sw_if_index=r.sw_if_index,
+            prefix="10.0.0.1/24",
+            is_add=0,
+        )
+        VppNeighbor(
+            self, r.sw_if_index, self.pg1.remote_mac, "10.0.0.2"
+        ).add_vpp_config()
+
+        n = 10
+        frames = [
+            Ether(dst=self.pg1.local_mac, src=self.pg1.remote_mac)
+            / IP(src=self.pg1.remote_ip4, dst="10.0.0.2")
+            / UDP(sport=555, dport=556 + i)
+            / Raw(b"\x00" * 80)
+            for i in range(n)
+        ]
+        rx = self.send_and_expect(self.pg1, frames * 2, self.pg0)
+
+        sports = {}
+        for p in rx:
+            sports.setdefault(p[GENEVE][UDP].dport, set()).add(p[UDP].sport)
+        for flow_sports in sports.values():
+            self.assertEqual(len(flow_sports), 1)
+        self.assertGreaterEqual(len(set().union(*sports.values())), 2)
 
 
 @unittest.skipIf("geneve" in config.excluded_plugins, "Exclude GENEVE plugin tests")

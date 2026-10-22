@@ -317,31 +317,20 @@ vnet_update_l2_len (vlib_buffer_t *b)
   return (ethertype);
 }
 
-/*
- * Compute flow hash of an ethernet packet, use 5-tuple hash if L3 packet
- * is ip4, ip6, or mpls. Otherwise hash on smac/dmac/etype.
- * The vlib buffer current pointer is expected to be at ethernet header
- * and vnet l2.l2_len is expected to be setup already.
- */
-static inline u32
-vnet_l2_compute_flow_hash (vlib_buffer_t * b)
+static_always_inline u32
+vnet_l2_flow_hash_inline (ethernet_header_t *eh, u8 *l3h, u16 ethertype)
 {
-  ethernet_header_t *eh = vlib_buffer_get_current (b);
-  u8 *l3h = (u8 *) eh + vnet_buffer (b)->l2.l2_len;
-  u16 ethertype = clib_net_to_host_u16 (*(u16 *) (l3h - 2));
-
   if (ethertype == ETHERNET_TYPE_IP4)
     return ip4_compute_flow_hash ((ip4_header_t *) l3h, IP_FLOW_HASH_DEFAULT);
   else if (ethertype == ETHERNET_TYPE_IP6)
     return ip6_compute_flow_hash ((ip6_header_t *) l3h, IP_FLOW_HASH_DEFAULT);
   else if (ethertype == ETHERNET_TYPE_MPLS)
-    return mpls_compute_flow_hash ((mpls_unicast_header_t *) l3h,
-				   IP_FLOW_HASH_DEFAULT);
+    return mpls_compute_flow_hash ((mpls_unicast_header_t *) l3h, IP_FLOW_HASH_DEFAULT);
   else
     {
       u32 a, b, c;
-      u32 *ap = (u32 *) & eh->dst_address[2];
-      u32 *bp = (u32 *) & eh->src_address[2];
+      u32 *ap = (u32 *) &eh->dst_address[2];
+      u32 *bp = (u32 *) &eh->src_address[2];
       a = *ap;
       b = *bp;
       c = ethertype;
@@ -349,6 +338,46 @@ vnet_l2_compute_flow_hash (vlib_buffer_t * b)
       hash_v3_finalize32 (a, b, c);
       return c;
     }
+}
+
+/*
+ * Compute flow hash of an ethernet packet, use 5-tuple hash if L3 packet
+ * is ip4, ip6, or mpls. Otherwise hash on smac/dmac/etype.
+ * The vlib buffer current pointer is expected to be at ethernet header
+ * and vnet l2.l2_len is expected to be setup already.
+ */
+static inline u32
+vnet_l2_compute_flow_hash (vlib_buffer_t *b)
+{
+  ethernet_header_t *eh = vlib_buffer_get_current (b);
+  u8 *l3h = (u8 *) eh + vnet_buffer (b)->l2.l2_len;
+  u16 ethertype = clib_net_to_host_u16 (*(u16 *) (l3h - 2));
+
+  return vnet_l2_flow_hash_inline (eh, l3h, ethertype);
+}
+
+/*
+ * Same hash as vnet_l2_compute_flow_hash, but up to two VLAN tags are read
+ * from the frame itself, so vnet l2.l2_len is not needed. Use it on ethernet
+ * interfaces: routed packets reach them without l2.l2_len set, and in the ip
+ * opaque the same byte holds ip.flow_hash.
+ */
+static inline u32
+vnet_l2_compute_frame_flow_hash (vlib_buffer_t *b)
+{
+  ethernet_header_t *eh = vlib_buffer_get_current (b);
+  u8 *l3h = (u8 *) (eh + 1);
+  u16 ethertype = clib_net_to_host_u16 (eh->type);
+  int n_tags;
+
+  for (n_tags = 0; n_tags < 2 && ethernet_frame_is_tagged (ethertype); n_tags++)
+    {
+      ethernet_vlan_header_t *vlan = (ethernet_vlan_header_t *) l3h;
+      ethertype = clib_net_to_host_u16 (vlan->type);
+      l3h += sizeof (*vlan);
+    }
+
+  return vnet_l2_flow_hash_inline (eh, l3h, ethertype);
 }
 
 #endif

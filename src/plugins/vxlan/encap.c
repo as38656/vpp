@@ -72,6 +72,7 @@ vxlan_encap_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   u32 sw_if_index0 = 0, sw_if_index1 = 0;
   u32 next0 = 0, next1 = 0;
   vxlan_tunnel_t *t0 = NULL, *t1 = NULL;
+  u8 is_eth0 = 0, is_eth1 = 0;
   index_t dpoi_idx0 = INDEX_INVALID, dpoi_idx1 = INDEX_INVALID;
   vlib_buffer_t *bufs[VLIB_FRAME_SIZE];
   vlib_buffer_t **b = bufs;
@@ -125,9 +126,6 @@ vxlan_encap_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  vlib_buffer_t *b1 = b[1];
 	  b += 2;
 
-	  u32 flow_hash0 = vnet_l2_compute_flow_hash (b0);
-	  u32 flow_hash1 = vnet_l2_compute_flow_hash (b1);
-
 	  /* Get next node index and adj index from tunnel next_dpo */
 	  if (sw_if_index0 != vnet_buffer (b0)->sw_if_index[VLIB_TX])
 	    {
@@ -135,6 +133,7 @@ vxlan_encap_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      vnet_hw_interface_t *hi0 =
 		vnet_get_sup_hw_interface (vnm, sw_if_index0);
 	      t0 = &vxm->tunnels[hi0->dev_instance];
+	      is_eth0 = hi0->hw_class_index == ethernet_hw_interface_class.index;
 	      /* Note: change to always set next0 if it may set to drop */
 	      next0 = t0->next_dpo.dpoi_next_node;
 	      dpoi_idx0 = t0->next_dpo.dpoi_index;
@@ -147,6 +146,7 @@ vxlan_encap_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		{
 		  sw_if_index1 = sw_if_index0;
 		  t1 = t0;
+		  is_eth1 = is_eth0;
 		  next1 = next0;
 		  dpoi_idx1 = dpoi_idx0;
 		}
@@ -156,11 +156,17 @@ vxlan_encap_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  vnet_hw_interface_t *hi1 =
 		    vnet_get_sup_hw_interface (vnm, sw_if_index1);
 		  t1 = &vxm->tunnels[hi1->dev_instance];
+		  is_eth1 = hi1->hw_class_index == ethernet_hw_interface_class.index;
 		  /* Note: change to always set next1 if it may set to drop */
 		  next1 = t1->next_dpo.dpoi_next_node;
 		  dpoi_idx1 = t1->next_dpo.dpoi_index;
 		}
 	    }
+
+	  u32 flow_hash0 =
+	    is_eth0 ? vnet_l2_compute_frame_flow_hash (b0) : vnet_l2_compute_flow_hash (b0);
+	  u32 flow_hash1 =
+	    is_eth1 ? vnet_l2_compute_frame_flow_hash (b1) : vnet_l2_compute_flow_hash (b1);
 
 	  vnet_buffer (b0)->ip.adj_index[VLIB_TX] = dpoi_idx0;
 	  vnet_buffer (b1)->ip.adj_index[VLIB_TX] = dpoi_idx1;
@@ -351,8 +357,6 @@ vxlan_encap_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  vlib_buffer_t *b0 = b[0];
 	  b += 1;
 
-	  u32 flow_hash0 = vnet_l2_compute_flow_hash (b0);
-
 	  /* Get next node index and adj index from tunnel next_dpo */
 	  if (sw_if_index0 != vnet_buffer (b0)->sw_if_index[VLIB_TX])
 	    {
@@ -360,10 +364,13 @@ vxlan_encap_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      vnet_hw_interface_t *hi0 =
 		vnet_get_sup_hw_interface (vnm, sw_if_index0);
 	      t0 = &vxm->tunnels[hi0->dev_instance];
+	      is_eth0 = hi0->hw_class_index == ethernet_hw_interface_class.index;
 	      /* Note: change to always set next0 if it may be set to drop */
 	      next0 = t0->next_dpo.dpoi_next_node;
 	      dpoi_idx0 = t0->next_dpo.dpoi_index;
 	    }
+	  u32 flow_hash0 =
+	    is_eth0 ? vnet_l2_compute_frame_flow_hash (b0) : vnet_l2_compute_flow_hash (b0);
 	  vnet_buffer (b0)->ip.adj_index[VLIB_TX] = dpoi_idx0;
 
 	  ASSERT (t0->rewrite_header.data_bytes == underlay_hdr_len);
