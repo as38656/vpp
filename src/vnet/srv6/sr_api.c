@@ -369,7 +369,8 @@ static void send_sr_localsid_details
   rmp->fib_table = htonl (t->fib_table);
   ip_address_encode (&t->next_hop, IP46_TYPE_ANY, &rmp->xconnect_nh_addr);
 
-  if (t->behavior == SR_BEHAVIOR_T || t->behavior == SR_BEHAVIOR_DT6)
+  if (t->behavior == SR_BEHAVIOR_T || t->behavior == SR_BEHAVIOR_DT6 ||
+      t->behavior == SR_BEHAVIOR_DT46)
     rmp->xconnect_iface_or_vrf_table =
       htonl (fib_table_get_table_id (t->sw_if_index, FIB_PROTOCOL_IP6));
   else if (t->behavior == SR_BEHAVIOR_DT4)
@@ -420,7 +421,8 @@ send_sr_localsid_with_packet_stats_details (int local_sid_index,
   rmp->fib_table = htonl (t->fib_table);
   ip_address_encode (&t->next_hop, IP46_TYPE_ANY, &rmp->xconnect_nh_addr);
 
-  if (t->behavior == SR_BEHAVIOR_T || t->behavior == SR_BEHAVIOR_DT6)
+  if (t->behavior == SR_BEHAVIOR_T || t->behavior == SR_BEHAVIOR_DT6 ||
+      t->behavior == SR_BEHAVIOR_DT46)
     rmp->xconnect_iface_or_vrf_table =
       htonl (fib_table_get_table_id (t->sw_if_index, FIB_PROTOCOL_IP6));
   else if (t->behavior == SR_BEHAVIOR_DT4)

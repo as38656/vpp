@@ -170,6 +170,10 @@ sr_cli_localsid (char is_del, ip6_address_t *localsid_addr, u16 localsid_prefix_
   if (FIB_NODE_INDEX_INVALID != fei)
     return -4;			//There is an entry for such address (the localsid addr)
 
+  if (behavior == SR_BEHAVIOR_DT46 && (fib_table_find (FIB_PROTOCOL_IP4, sw_if_index) == ~0 ||
+				       fib_table_find (FIB_PROTOCOL_IP6, sw_if_index) == ~0))
+    return -7;
+
   /* Create a new localsid registry */
   pool_get (sm->localsids, ls);
   clib_memset (ls, 0, sizeof (*ls));
@@ -238,6 +242,10 @@ sr_cli_localsid (char is_del, ip6_address_t *localsid_addr, u16 localsid_prefix_
       break;
     case SR_BEHAVIOR_DT4:
       ls->vrf_index = fib_table_find (FIB_PROTOCOL_IP4, sw_if_index);
+      break;
+    case SR_BEHAVIOR_DT46:
+      ls->vrf_index = fib_table_find (FIB_PROTOCOL_IP6, sw_if_index);
+      ls->ip4_vrf_index = fib_table_find (FIB_PROTOCOL_IP4, sw_if_index);
       break;
     case SR_BEHAVIOR_DX2:
       ls->sw_if_index = sw_if_index;
@@ -404,6 +412,8 @@ sr_cli_localsid_command_fn (vlib_main_t * vm, unformat_input_t * input,
 	    behavior = SR_BEHAVIOR_DT6;
 	  else if (unformat (input, "end.dt4 %u", &sw_if_index))
 	    behavior = SR_BEHAVIOR_DT4;
+	  else if (unformat (input, "end.dt46 %u", &sw_if_index))
+	    behavior = SR_BEHAVIOR_DT46;
 	  else if (unformat (input, "un %u", &usid_size))
 	    behavior = SR_BEHAVIOR_END_UN_PERF;
 	  else if (unformat (input, "un.flex %u", &usid_size))
@@ -515,6 +525,8 @@ sr_cli_localsid_command_fn (vlib_main_t * vm, unformat_input_t * input,
     case -6:
       return clib_error_return (0,
 				"Error on the plugin based localsid creation.");
+    case -7:
+      return clib_error_return (0, "End.DT46 needs an IPv4 and an IPv6 table %u", sw_if_index);
     default:
       return clib_error_return (0, "BUG: sr localsid returns %d", rv);
     }
@@ -525,31 +537,33 @@ VLIB_CLI_COMMAND (sr_localsid_command, static) = {
   .path = "sr localsid",
   .short_help = "sr localsid (del) address XX:XX::YY:YY"
 		"(fib-table 8) behavior STRING",
-  .long_help =
-    "Create SR LocalSID and binds it to a particular behavior\n"
-    "Arguments:\n"
-    "\tlocalSID IPv6_addr(128b)   LocalSID IPv6 address\n"
-    "\t(fib-table X)              Optional. VRF where to install SRv6 "
-    "localsid\n"
-    "\tbehavior STRING            Specifies the behavior\n"
-    "\n\tBehaviors:\n"
-    "\tEnd\t-> Endpoint.\n"
-    "\tEnd.uN\t-> Endpoint with uSID.\n"
-    "\tuA\t-> Endpoint with uSID and Layer-3 cross-connect.\n"
-    "\tEnd.X\t-> Endpoint with Layer-3 cross-connect.\n"
-    "\t\tParameters: '<iface> <ip6_next_hop>'\n"
-    "\tEnd.DX2\t-> Endpoint with decapsulation and Layer-2 cross-connect.\n"
-    "\t\tParameters: '<iface>'\n"
-    "\tEnd.DX6\t-> Endpoint with decapsulation and IPv6 cross-connect.\n"
-    "\t\tParameters: '<iface> <ip6_next_hop>'\n"
-    "\tEnd.DX4\t-> Endpoint with decapsulation and IPv4 cross-connect.\n"
-    "\t\tParameters: '<iface> <ip4_next_hop>'\n"
-    "\tEnd.DT6\t-> Endpoint with decapsulation and specific IPv6 table "
-    "lookup.\n"
-    "\t\tParameters: '<ip6_fib_table>'\n"
-    "\tEnd.DT4\t-> Endpoint with decapsulation and specific IPv4 table "
-    "lookup.\n"
-    "\t\tParameters: '<ip4_fib_table>'\n",
+  .long_help = "Create SR LocalSID and binds it to a particular behavior\n"
+	       "Arguments:\n"
+	       "\tlocalSID IPv6_addr(128b)   LocalSID IPv6 address\n"
+	       "\t(fib-table X)              Optional. VRF where to install SRv6 "
+	       "localsid\n"
+	       "\tbehavior STRING            Specifies the behavior\n"
+	       "\n\tBehaviors:\n"
+	       "\tEnd\t-> Endpoint.\n"
+	       "\tEnd.uN\t-> Endpoint with uSID.\n"
+	       "\tuA\t-> Endpoint with uSID and Layer-3 cross-connect.\n"
+	       "\tEnd.X\t-> Endpoint with Layer-3 cross-connect.\n"
+	       "\t\tParameters: '<iface> <ip6_next_hop>'\n"
+	       "\tEnd.DX2\t-> Endpoint with decapsulation and Layer-2 cross-connect.\n"
+	       "\t\tParameters: '<iface>'\n"
+	       "\tEnd.DX6\t-> Endpoint with decapsulation and IPv6 cross-connect.\n"
+	       "\t\tParameters: '<iface> <ip6_next_hop>'\n"
+	       "\tEnd.DX4\t-> Endpoint with decapsulation and IPv4 cross-connect.\n"
+	       "\t\tParameters: '<iface> <ip4_next_hop>'\n"
+	       "\tEnd.DT6\t-> Endpoint with decapsulation and specific IPv6 table "
+	       "lookup.\n"
+	       "\t\tParameters: '<ip6_fib_table>'\n"
+	       "\tEnd.DT4\t-> Endpoint with decapsulation and specific IPv4 table "
+	       "lookup.\n"
+	       "\t\tParameters: '<ip4_fib_table>'\n"
+	       "\tEnd.DT46\t-> Endpoint with decapsulation and specific IPv4 and IPv6 "
+	       "table lookup.\n"
+	       "\t\tParameters: '<fib_table>'\n",
   .function = sr_cli_localsid_command_fn,
 };
 
@@ -659,6 +673,15 @@ show_sr_localsid_command_fn (vlib_main_t * vm, unformat_input_t * input,
 			   &ls->localsid, ls->localsid_prefix_len,
 			   fib_table_get_table_id (ls->vrf_index,
 						   FIB_PROTOCOL_IP4));
+	  break;
+	case SR_BEHAVIOR_DT46:
+	  vlib_cli_output (
+	    vm,
+	    "\tAddress: \t%U/%u\n\tBehavior: \tDT46 (Endpoint with decapsulation and "
+	    "specific IPv4 and IPv6 table lookup)"
+	    "\n\tTable: \t%u",
+	    format_ip6_address, &ls->localsid, ls->localsid_prefix_len,
+	    fib_table_get_table_id (ls->vrf_index, FIB_PROTOCOL_IP6));
 	  break;
 	default:
 	  if (ls->behavior >= SR_BEHAVIOR_CURRENT_LAST)
@@ -819,6 +842,9 @@ format_sr_localsid_trace (u8 * s, va_list * args)
       break;
     case SR_BEHAVIOR_DT4:
       s = format (s, "\tBehavior: Decapsulation with IPv4 Table lookup\n");
+      break;
+    case SR_BEHAVIOR_DT46:
+      s = format (s, "\tBehavior: Decapsulation with IPv4 or IPv6 Table lookup\n");
       break;
     case SR_BEHAVIOR_DX2:
       s = format (s, "\tBehavior: Decapsulation with L2 xconnect\n");
@@ -1133,7 +1159,7 @@ end_decaps_srh_processing (vlib_node_runtime_t * node,
 	  *next0 = SR_LOCALSID_NEXT_IP6_REWRITE;
 	  return;
 	}
-      else if (ls0->behavior == SR_BEHAVIOR_DT6)
+      else if (ls0->behavior == SR_BEHAVIOR_DT6 || ls0->behavior == SR_BEHAVIOR_DT46)
 	{
 	  vlib_buffer_advance (b0, total_size);
 	  vnet_buffer (b0)->sw_if_index[VLIB_TX] = ls0->vrf_index;
@@ -1153,6 +1179,13 @@ end_decaps_srh_processing (vlib_node_runtime_t * node,
 	{
 	  vlib_buffer_advance (b0, total_size);
 	  vnet_buffer (b0)->sw_if_index[VLIB_TX] = ls0->vrf_index;
+	  *next0 = SR_LOCALSID_NEXT_IP4_LOOKUP;
+	  return;
+	}
+      else if (ls0->behavior == SR_BEHAVIOR_DT46)
+	{
+	  vlib_buffer_advance (b0, total_size);
+	  vnet_buffer (b0)->sw_if_index[VLIB_TX] = ls0->ip4_vrf_index;
 	  *next0 = SR_LOCALSID_NEXT_IP4_LOOKUP;
 	  return;
 	}
@@ -2415,28 +2448,29 @@ show_sr_localsid_behaviors_command_fn (vlib_main_t * vm,
     { vec_add1 (plugins_vec, plugin); }
 
   /* Print static behaviors */
-  vlib_cli_output (
-    vm,
-    "Default behaviors:\n"
-    "\tEnd\t-> Endpoint.\n"
-    "\tEnd.X\t-> Endpoint with Layer-3 cross-connect.\n"
-    "\tuN\t-> Endpoint with uSID.\n"
-    "\tuA\t-> Endpoint with uSID and Layer-3 cross-connect.\n"
-    "\t\tParameters: '<iface> <ip6_next_hop>'\n"
-    "\tEnd.T\t-> Endpoint with specific IPv6 table lookup.\n"
-    "\t\tParameters: '<fib_table>'\n"
-    "\tEnd.DX2\t-> Endpoint with decapsulation and Layer-2 cross-connect.\n"
-    "\t\tParameters: '<iface>'\n"
-    "\tEnd.DX6\t-> Endpoint with decapsulation and IPv6 cross-connect.\n"
-    "\t\tParameters: '<iface> <ip6_next_hop>'\n"
-    "\tEnd.DX4\t-> Endpoint with decapsulation and IPv4 cross-connect.\n"
-    "\t\tParameters: '<iface> <ip4_next_hop>'\n"
-    "\tEnd.DT6\t-> Endpoint with decapsulation and specific IPv6 table "
-    "lookup.\n"
-    "\t\tParameters: '<ip6_fib_table>'\n"
-    "\tEnd.DT4\t-> Endpoint with decapsulation and specific IPv4 table "
-    "lookup.\n"
-    "\t\tParameters: '<ip4_fib_table>'\n");
+  vlib_cli_output (vm, "Default behaviors:\n"
+		       "\tEnd\t-> Endpoint.\n"
+		       "\tEnd.X\t-> Endpoint with Layer-3 cross-connect.\n"
+		       "\tuN\t-> Endpoint with uSID.\n"
+		       "\tuA\t-> Endpoint with uSID and Layer-3 cross-connect.\n"
+		       "\t\tParameters: '<iface> <ip6_next_hop>'\n"
+		       "\tEnd.T\t-> Endpoint with specific IPv6 table lookup.\n"
+		       "\t\tParameters: '<fib_table>'\n"
+		       "\tEnd.DX2\t-> Endpoint with decapsulation and Layer-2 cross-connect.\n"
+		       "\t\tParameters: '<iface>'\n"
+		       "\tEnd.DX6\t-> Endpoint with decapsulation and IPv6 cross-connect.\n"
+		       "\t\tParameters: '<iface> <ip6_next_hop>'\n"
+		       "\tEnd.DX4\t-> Endpoint with decapsulation and IPv4 cross-connect.\n"
+		       "\t\tParameters: '<iface> <ip4_next_hop>'\n"
+		       "\tEnd.DT6\t-> Endpoint with decapsulation and specific IPv6 table "
+		       "lookup.\n"
+		       "\t\tParameters: '<ip6_fib_table>'\n"
+		       "\tEnd.DT4\t-> Endpoint with decapsulation and specific IPv4 table "
+		       "lookup.\n"
+		       "\t\tParameters: '<ip4_fib_table>'\n"
+		       "\tEnd.DT46\t-> Endpoint with decapsulation and specific IPv4 and IPv6 "
+		       "table lookup.\n"
+		       "\t\tParameters: '<fib_table>'\n");
   vlib_cli_output (vm, "Plugin behaviors:\n");
   for (i = 0; i < vec_len (plugins_vec); i++)
     {

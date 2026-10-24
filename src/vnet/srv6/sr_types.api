@@ -39,6 +39,7 @@ enum sr_behavior : u8
   SR_BEHAVIOR_API_END_UN_PERF = 11 [backwards_compatible],
   SR_BEHAVIOR_API_END_UN	= 12 [backwards_compatible],
   SR_BEHAVIOR_API_UA = 13 [backwards_compatible],
+  SR_BEHAVIOR_API_DT46 = 14 [backwards_compatible],
 };
 
 enum sr_steer : u8

@@ -43,13 +43,14 @@
 #define SR_BEHAVIOR_END_UN_PERF 11
 #define SR_BEHAVIOR_END_UN	12
 #define SR_BEHAVIOR_UA		13
+#define SR_BEHAVIOR_DT46	14
 
 /**
  * SR_BEHAVIOR_CURRENT_LAST
  * MUST be updated everytime we add new behaviors.
  * MUST be set to value of last added behavior + 1.
  * */
-#define SR_BEHAVIOR_CURRENT_LAST 14
+#define SR_BEHAVIOR_CURRENT_LAST 15
 
 #define SR_STEER_L2 2
 #define SR_STEER_IPV4 4
@@ -142,6 +143,8 @@ typedef struct
     u32 sw_if_index;				/**< xconnect only */
     u32 vrf_index;				/**< vrf only */
   };
+
+  u32 ip4_vrf_index; /**< IPv4 FIB index for End.DT46. vrf_index is IPv6 */
 
   u32 fib_table;				/**< FIB table where localsid is registered */
 
