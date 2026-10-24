@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 
-import unittest
+import re
 import socket
+import subprocess
+import unittest
 from ipaddress import ip_address, ip_interface
 
 from scapy.layers.inet import IP, UDP
-from scapy.layers.inet6 import IPv6, Raw
+from scapy.layers.inet6 import IPv6, IPv6ExtHdrSegmentRouting, Raw
 from scapy.layers.l2 import Ether, ARP, Dot3, LLC
 from scapy.contrib.lacp import LACP
 from scapy.contrib.lldp import (
@@ -36,6 +38,7 @@ from template_ipsec import (
 from test_ipsec_tun_if_esp import TemplateIpsecItf4
 from config import config
 from vpp_ip_route import FibPathType
+from vpp_papi import VppEnum
 from vpp_qemu_utils import (
     add_namespace_route,
     add_namespace_multipath_route,
@@ -1634,3 +1637,481 @@ class TestLinuxCPPairManagement(TestLinuxCPNetNSBase):
             self.vapi.cli(f"lcp delete {pg.name}")
         finally:
             self.vapi.cli("lcp lcp-auto-subint off")
+
+
+class TestLinuxCPSRv6Base(TestLinuxCPNetNSBase):
+    """Two pg interfaces with Linux pairs: pg0 to the core in table 0,
+    pg1 to a customer in table 100, which is VRF vrf100 in Linux."""
+
+    vrf = 100
+    encap_source = "2001:db8:ff::1"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.vapi.cli(f"ip table add {cls.vrf}")
+        cls.vapi.cli(f"ip6 table add {cls.vrf}")
+        cls.create_pg_interfaces(range(2))
+        cls.pg1.set_table_ip4(cls.vrf)
+        cls.pg1.set_table_ip6(cls.vrf)
+        # The kernel sends a DAD solicitation up to a second after an address
+        # is added, and the captures of the tests would count it.
+        cls.ns_run("sysctl", "-w", "net.ipv6.conf.default.accept_dad=0")
+        for pg in cls.pg_interfaces:
+            cls.vapi.cli(f"lcp create {pg.name} host-if h{pg.name} netns {cls.ns_name}")
+            pg.admin_up()
+
+        # Joining a VRF cycles the Linux interface, which drops its IPv6
+        # addresses. So it joins before lcp-sync copies the addresses.
+        cls.ns_run("sysctl", "-w", "net.vrf.strict_mode=1")
+        cls.ns_ip("link", "add", "vrf100", "type", "vrf", "table", str(cls.vrf))
+        cls.ns_ip("link", "set", "vrf100", "up")
+        cls.ns_ip("link", "set", "hpg1", "master", "vrf100")
+
+        cls.pg0.config_ip6()
+        cls.pg1.config_ip4()
+        cls.pg1.config_ip6()
+        cls.pg0.configure_ipv6_neighbors()
+        cls.pg1.configure_ipv4_neighbors()
+        cls.pg1.configure_ipv6_neighbors()
+
+    def tearDown(self):
+        # Routes that a failed test leaves would change the counts of the next test.
+        for family, table in (
+            ("-4", str(self.vrf)),
+            ("-6", str(self.vrf)),
+            ("-6", "main"),
+        ):
+            self.ns_ip(family, "route", "flush", "table", table, "proto", "boot")
+        self.wait_srv6_counts("no SRv6 state left", 0, 0, 0)
+        super().tearDown()
+
+    @classmethod
+    def ns_run(cls, *cmd):
+        subprocess.run(["ip", "netns", "exec", cls.ns_name, *cmd], check=True)
+
+    @classmethod
+    def ns_ip(cls, *args):
+        cls.ns_run("ip", *args)
+
+    def srv6_counts(self):
+        """Routes, policies and local SIDs that linux-nl has in VPP."""
+        out = self.vapi.cli("show lcp srv6")
+        m = re.search(r"(\d+) routes, (\d+) policies, (\d+) local SIDs", out)
+        return tuple(int(n) for n in m.groups()) if m else out
+
+    def wait_srv6_counts(self, description, routes, policies, local_sids):
+        self.poll_for(
+            description, self.srv6_counts, (routes, policies, local_sids), timeout=5
+        )
+
+    def localsid_behaviors(self):
+        return {str(ls.addr): ls.behavior for ls in self.vapi.sr_localsids_dump()}
+
+    def core_route(self, prefix):
+        """A route to another node's locator through pg0."""
+        self.ns_ip(
+            "-6", "route", "add", prefix, "via", self.pg0.remote_ip6, "dev", "hpg0"
+        )
+
+    def customer_packet(self, dst):
+        ip = IP if ":" not in dst else IPv6
+        src = self.pg1.remote_ip4 if ip is IP else self.pg1.remote_ip6
+        return (
+            Ether(src=self.pg1.remote_mac, dst=self.pg1.local_mac)
+            / ip(src=src, dst=dst)
+            / UDP(sport=1234, dport=5678)
+            / Raw(b"\xa5" * 64)
+        )
+
+    def core_packet(self, dst, inner, srh=None):
+        p = Ether(src=self.pg0.remote_mac, dst=self.pg0.local_mac) / IPv6(
+            src=self.pg0.remote_ip6, dst=dst
+        )
+        if srh is not None:
+            p /= srh
+        return p / inner / UDP(sport=1234, dport=5678) / Raw(b"\xa5" * 64)
+
+
+@unittest.skipIf(config.skip_netns_tests, "netns not available or disabled from cli")
+class TestLinuxCPSRv6(TestLinuxCPSRv6Base):
+    """Linux CP SRv6 routes"""
+
+    extra_vpp_config = [
+        "linux-nl-srv6",
+        "{",
+        "bsid-prefix",
+        "fc00:ffff::/64",
+        "encap-source",
+        TestLinuxCPSRv6Base.encap_source,
+        "}",
+    ]
+
+    def encap_route(self, op, prefix, segs, family="-4"):
+        self.ns_ip(
+            family,
+            "route",
+            op,
+            prefix,
+            "vrf",
+            "vrf100",
+            "encap",
+            "seg6",
+            "mode",
+            "encap",
+            "segs",
+            segs,
+            "via",
+            "inet6",
+            self.pg0.remote_ip6,
+            "dev",
+            "hpg0",
+        )
+
+    def verify_encapsulated(self, rx, sids, inner_dst):
+        for p in rx:
+            self.assertEqual(p[IPv6].src, self.encap_source)
+            self.assertEqual(p[IPv6].dst, sids[0])
+            if len(sids) == 1:
+                self.assertNotIn(IPv6ExtHdrSegmentRouting, p)
+            else:
+                srh = p[IPv6ExtHdrSegmentRouting]
+                self.assertEqual(srh.addresses, list(reversed(sids)))
+                self.assertEqual(srh.segleft, len(sids) - 1)
+            inner = p[IPv6].payload
+            if isinstance(inner, IPv6ExtHdrSegmentRouting):
+                inner = inner.payload
+            self.assertEqual(inner.dst, inner_dst)
+
+    def test_srv6_encap_ipv4(self):
+        """IPv4 route with an SRv6 encapsulation in a VRF"""
+        self.core_route("fc00:0:2::/48")
+        self.encap_route("add", "10.200.0.0/24", "fc00:0:2:40::")
+        self.wait_srv6_counts("route and policy", 1, 1, 0)
+
+        rx = self.send_and_expect(
+            self.pg1, [self.customer_packet("10.200.0.5")] * 3, self.pg0
+        )
+        self.verify_encapsulated(rx, ["fc00:0:2:40::"], "10.200.0.5")
+
+        self.ns_ip("-4", "route", "del", "10.200.0.0/24", "vrf", "vrf100")
+        self.wait_srv6_counts("route and policy removed", 0, 0, 0)
+        self.send_and_assert_no_replies(self.pg1, [self.customer_packet("10.200.0.5")])
+
+    def test_srv6_encap_ipv6_srh(self):
+        """IPv6 route with two segments, which needs an SRH"""
+        sids = ["fc00:0:2:41::", "fc00:0:3:40::"]
+        self.core_route("fc00:0:2::/48")
+        self.encap_route("add", "2001:db8:200::/64", ",".join(sids), family="-6")
+        self.wait_srv6_counts("route and policy", 1, 1, 0)
+
+        rx = self.send_and_expect(
+            self.pg1, [self.customer_packet("2001:db8:200::5")] * 3, self.pg0
+        )
+        self.verify_encapsulated(rx, sids, "2001:db8:200::5")
+
+        self.ns_ip("-6", "route", "del", "2001:db8:200::/64", "vrf", "vrf100")
+        self.wait_srv6_counts("route and policy removed", 0, 0, 0)
+
+    def test_srv6_encap_replace(self):
+        """Routes share a policy and change between SRv6 and plain"""
+        self.core_route("fc00:0:2::/48")
+        self.core_route("fc00:0:3::/48")
+        self.encap_route("add", "10.201.0.0/24", "fc00:0:2:40::")
+        self.encap_route("add", "10.202.0.0/24", "fc00:0:2:40::")
+        self.wait_srv6_counts("two routes, one policy", 2, 1, 0)
+
+        self.ns_ip(
+            "-4",
+            "route",
+            "replace",
+            "10.201.0.0/24",
+            "vrf",
+            "vrf100",
+            "via",
+            self.pg1.remote_ip4,
+            "dev",
+            "hpg1",
+        )
+        self.wait_srv6_counts("plain route replaced SRv6", 1, 1, 0)
+        rx = self.send_and_expect(
+            self.pg1, [self.customer_packet("10.201.0.5")], self.pg1
+        )
+        self.assertNotIn(IPv6, rx[0])
+
+        self.encap_route("replace", "10.201.0.0/24", "fc00:0:3:40::")
+        self.wait_srv6_counts("SRv6 route replaced plain", 2, 2, 0)
+        rx = self.send_and_expect(
+            self.pg1, [self.customer_packet("10.201.0.5")], self.pg0
+        )
+        self.verify_encapsulated(rx, ["fc00:0:3:40::"], "10.201.0.5")
+
+        self.encap_route("replace", "10.201.0.0/24", "fc00:0:2:40::")
+        self.wait_srv6_counts("segments replaced", 2, 1, 0)
+        rx = self.send_and_expect(
+            self.pg1, [self.customer_packet("10.201.0.5")], self.pg0
+        )
+        self.verify_encapsulated(rx, ["fc00:0:2:40::"], "10.201.0.5")
+
+        # the same segments again, as when only the IGP next hop changes
+        self.encap_route("replace", "10.201.0.0/24", "fc00:0:2:40::")
+        self.wait_srv6_counts("same route again", 2, 1, 0)
+        rx = self.send_and_expect(
+            self.pg1, [self.customer_packet("10.201.0.5")], self.pg0
+        )
+        self.verify_encapsulated(rx, ["fc00:0:2:40::"], "10.201.0.5")
+
+        for prefix in ("10.201.0.0/24", "10.202.0.0/24"):
+            self.ns_ip("-4", "route", "del", prefix, "vrf", "vrf100")
+        self.wait_srv6_counts("routes removed", 0, 0, 0)
+
+    def test_srv6_encap_multipath(self):
+        """Multipath route with one segment list per next hop"""
+        self.core_route("fc00:0:2::/48")
+        self.core_route("fc00:0:3::/48")
+        nexthops = []
+        for sid in ("fc00:0:2:40::", "fc00:0:3:40::"):
+            nexthops += [
+                "nexthop",
+                "encap",
+                "seg6",
+                "mode",
+                "encap",
+                "segs",
+                sid,
+                "via",
+                "inet6",
+                self.pg0.remote_ip6,
+                "dev",
+                "hpg0",
+            ]
+        self.ns_ip("-4", "route", "add", "10.203.0.0/24", "vrf", "vrf100", *nexthops)
+        self.wait_srv6_counts("route with two policies", 1, 2, 0)
+
+        pkts = [self.customer_packet("10.203.0.5") / Raw(bytes([i])) for i in range(64)]
+        for i, p in enumerate(pkts):
+            p[UDP].sport = 1000 + i
+        rx = self.send_and_expect(self.pg1, pkts, self.pg0)
+        self.assertEqual({p[IPv6].dst for p in rx}, {"fc00:0:2:40::", "fc00:0:3:40::"})
+
+        self.ns_ip("-4", "route", "del", "10.203.0.0/24", "vrf", "vrf100")
+        self.wait_srv6_counts("route removed", 0, 0, 0)
+
+    def test_srv6_local_dt46(self):
+        """End.DT46 decapsulates IPv4 and IPv6 into the VRF"""
+        sid = "fc00:0:1:40::"
+        self.ns_ip(
+            "-6",
+            "route",
+            "add",
+            sid,
+            "encap",
+            "seg6local",
+            "action",
+            "End.DT46",
+            "vrftable",
+            str(self.vrf),
+            "dev",
+            "vrf100",
+        )
+        self.wait_srv6_counts("local SID", 0, 0, 1)
+        self.assertEqual(
+            self.localsid_behaviors().get(sid),
+            VppEnum.vl_api_sr_behavior_t.SR_BEHAVIOR_API_DT46,
+        )
+
+        for inner, dst in (
+            (IP(src="192.0.2.1", dst=self.pg1.remote_ip4), self.pg1.remote_ip4),
+            (IPv6(src="2001:db8:9::1", dst=self.pg1.remote_ip6), self.pg1.remote_ip6),
+        ):
+            rx = self.send_and_expect(
+                self.pg0, [self.core_packet(sid, inner)] * 3, self.pg1
+            )
+            for p in rx:
+                self.assertEqual(p[1].dst, dst)
+
+        self.ns_ip("-6", "route", "del", sid)
+        self.wait_srv6_counts("local SID removed", 0, 0, 0)
+        self.assertNotIn(sid, self.localsid_behaviors())
+
+    def test_srv6_local_end_next_csid(self):
+        """End with NEXT-C-SID shifts the C-SIDs (End.uN)"""
+        self.core_route("fc00:0:2::/48")
+        self.ns_ip(
+            "-6",
+            "route",
+            "add",
+            "fc00:0:1::/48",
+            "encap",
+            "seg6local",
+            "action",
+            "End",
+            "flavors",
+            "next-csid",
+            "lblen",
+            "32",
+            "nflen",
+            "16",
+            "dev",
+            "hpg0",
+        )
+        self.wait_srv6_counts("local SID", 0, 0, 1)
+        self.assertEqual(
+            self.localsid_behaviors().get("fc00:0:1::"),
+            VppEnum.vl_api_sr_behavior_t.SR_BEHAVIOR_API_END_UN,
+        )
+
+        inner = IP(src="192.0.2.1", dst="192.0.2.2")
+        rx = self.send_and_expect(
+            self.pg0, [self.core_packet("fc00:0:1:2:40::", inner)] * 3, self.pg0
+        )
+        for p in rx:
+            self.assertEqual(p[IPv6].dst, "fc00:0:2:40::")
+
+        self.ns_ip("-6", "route", "del", "fc00:0:1::/48")
+        self.wait_srv6_counts("local SID removed", 0, 0, 0)
+
+    def test_srv6_local_end_x(self):
+        """End.X and End.X with NEXT-C-SID (uA) forward to the neighbor"""
+        # The uA SID has no oif, like the SIDs of routing daemons: the next
+        # hop is on the device of the route.
+        for sid, args in (
+            ("fc00:0:1:e000::", ["oif", "hpg0"]),
+            (
+                "fc00:0:e000::/48",
+                ["flavors", "next-csid", "lblen", "32", "nflen", "16"],
+            ),
+        ):
+            self.ns_ip(
+                "-6",
+                "route",
+                "add",
+                sid,
+                "encap",
+                "seg6local",
+                "action",
+                "End.X",
+                "nh6",
+                self.pg0.remote_ip6,
+                *args,
+                "dev",
+                "hpg0",
+            )
+        self.wait_srv6_counts("local SIDs", 0, 0, 2)
+        behaviors = self.localsid_behaviors()
+        self.assertEqual(
+            behaviors.get("fc00:0:1:e000::"),
+            VppEnum.vl_api_sr_behavior_t.SR_BEHAVIOR_API_X,
+        )
+        self.assertEqual(
+            behaviors.get("fc00:0:e000::"),
+            VppEnum.vl_api_sr_behavior_t.SR_BEHAVIOR_API_UA,
+        )
+
+        inner = IP(src="192.0.2.1", dst="192.0.2.2")
+        srh = IPv6ExtHdrSegmentRouting(
+            addresses=["fc00:0:9:40::", "fc00:0:1:e000::"], segleft=1
+        )
+        rx = self.send_and_expect(
+            self.pg0, [self.core_packet("fc00:0:1:e000::", inner, srh)] * 3, self.pg0
+        )
+        for p in rx:
+            self.assertEqual(p[Ether].dst, self.pg0.remote_mac)
+            self.assertEqual(p[IPv6].dst, "fc00:0:9:40::")
+
+        rx = self.send_and_expect(
+            self.pg0, [self.core_packet("fc00:0:e000:9:40::", inner)] * 3, self.pg0
+        )
+        for p in rx:
+            self.assertEqual(p[Ether].dst, self.pg0.remote_mac)
+            self.assertEqual(p[IPv6].dst, "fc00:0:9:40::")
+
+        self.ns_ip("-6", "route", "del", "fc00:0:1:e000::")
+        self.ns_ip("-6", "route", "del", "fc00:0:e000::/48")
+        self.wait_srv6_counts("local SIDs removed", 0, 0, 0)
+
+    def test_srv6_unsupported(self):
+        """SRv6 routes that VPP cannot program are left out"""
+        self.ns_ip(
+            "-6",
+            "route",
+            "add",
+            "fc00:0:1:b6::",
+            "encap",
+            "seg6local",
+            "action",
+            "End.B6",
+            "srh",
+            "segs",
+            "fc00:0:5::",
+            "dev",
+            "hpg0",
+        )
+        self.ns_ip(
+            "-6",
+            "route",
+            "add",
+            "2001:db8:300::/64",
+            "encap",
+            "seg6",
+            "mode",
+            "inline",
+            "segs",
+            "fc00:0:5::",
+            "dev",
+            "hpg0",
+        )
+        # a supported route after them shows that they were processed
+        self.encap_route("add", "10.204.0.0/24", "fc00:0:2:40::")
+        self.wait_srv6_counts("only the supported route", 1, 1, 0)
+        self.assertNotIn("fc00:0:1:b6::", self.localsid_behaviors())
+
+        self.ns_ip("-6", "route", "del", "fc00:0:1:b6::")
+        self.ns_ip("-6", "route", "del", "2001:db8:300::/64")
+        self.ns_ip("-4", "route", "del", "10.204.0.0/24", "vrf", "vrf100")
+        self.wait_srv6_counts("route removed", 0, 0, 0)
+
+
+@unittest.skipIf(config.skip_netns_tests, "netns not available or disabled from cli")
+class TestLinuxCPSRv6NoConfig(TestLinuxCPSRv6Base):
+    """Linux CP SRv6 routes without linux-nl-srv6 config"""
+
+    def test_srv6_encap_needs_config(self):
+        """Encapsulation needs a BSID prefix and a source; local SIDs do not"""
+        self.ns_ip(
+            "-4",
+            "route",
+            "add",
+            "10.200.0.0/24",
+            "vrf",
+            "vrf100",
+            "encap",
+            "seg6",
+            "mode",
+            "encap",
+            "segs",
+            "fc00:0:2:40::",
+            "via",
+            "inet6",
+            self.pg0.remote_ip6,
+            "dev",
+            "hpg0",
+        )
+        self.ns_ip(
+            "-6",
+            "route",
+            "add",
+            "fc00:0:1:40::",
+            "encap",
+            "seg6local",
+            "action",
+            "End.DT46",
+            "vrftable",
+            str(self.vrf),
+            "dev",
+            "vrf100",
+        )
+        self.wait_srv6_counts("only the local SID", 0, 0, 1)
+        self.ns_ip("-4", "route", "del", "10.200.0.0/24", "vrf", "vrf100")
+        self.ns_ip("-6", "route", "del", "fc00:0:1:40::")
+        self.wait_srv6_counts("local SID removed", 0, 0, 0)

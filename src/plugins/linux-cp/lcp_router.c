@@ -10,6 +10,7 @@
 #include <vlib/unix/plugin.h>
 #include <linux-cp/lcp_nl.h>
 #include <linux-cp/lcp_interface.h>
+#include <linux-cp/lcp_router.h>
 
 #include <netlink/msg.h>
 #include <netlink/netlink.h>
@@ -28,15 +29,6 @@
 #include <vnet/ip/ip6_ll_table.h>
 #include <vnet/ip-neighbor/ip_neighbor.h>
 #include <vnet/ip/ip6_link.h>
-
-typedef struct lcp_router_table_t_
-{
-  uint32_t nlt_id;
-  fib_protocol_t nlt_proto;
-  u32 nlt_fib_index;
-  u32 nlt_mfib_index;
-  u32 nlt_refs;
-} lcp_router_table_t;
 
 static uword *lcp_router_table_db[FIB_PROTOCOL_MAX];
 static lcp_router_table_t *lcp_router_table_pool;
@@ -88,7 +80,7 @@ static const mfib_prefix_t ip6_specials[] = {
 /* VIF to PHY DB of managed interfaces */
 static uword *lcp_routing_itf_db;
 
-static u32
+u32
 lcp_router_intf_h2p (u32 host)
 {
   lcp_itf_pair_t *lip;
@@ -900,8 +892,8 @@ lcp_router_neigh_sync_end (void)
   LCP_ROUTER_INFO ("End synchronization of neighbors");
 }
 
-static lcp_router_table_t *
-lcp_router_table_find (uint32_t id, fib_protocol_t fproto)
+lcp_router_table_t *
+lcp_router_table_find (u32 id, fib_protocol_t fproto)
 {
   uword *p;
 
@@ -913,8 +905,8 @@ lcp_router_table_find (uint32_t id, fib_protocol_t fproto)
   return (NULL);
 }
 
-static uint32_t
-lcp_router_table_k2f (uint32_t k)
+u32
+lcp_router_table_k2f (u32 k)
 {
   // the kernel's table ID 255 is the default table
   if (k == 255 || k == 254)
@@ -922,8 +914,8 @@ lcp_router_table_k2f (uint32_t k)
   return k;
 }
 
-static lcp_router_table_t *
-lcp_router_table_add_or_lock (uint32_t id, fib_protocol_t fproto)
+lcp_router_table_t *
+lcp_router_table_add_or_lock (u32 id, fib_protocol_t fproto)
 {
   lcp_router_table_t *nlt;
 
@@ -996,7 +988,7 @@ lcp_router_table_add_or_lock (uint32_t id, fib_protocol_t fproto)
   return (nlt);
 }
 
-static void
+void
 lcp_router_table_unlock (lcp_router_table_t *nlt)
 {
   nlt->nlt_refs--;
@@ -1230,14 +1222,14 @@ static const fib_route_path_flags_t
     [RTN_BLACKHOLE] = FIB_ROUTE_PATH_DROP,
   };
 
-static inline fib_source_t
+fib_source_t
 lcp_router_proto_fib_source (u8 rt_proto)
 {
   return (rt_proto <= RTPROT_STATIC) ? lcp_rt_fib_src : lcp_rt_fib_src_dynamic;
 }
 
-static fib_entry_flag_t
-lcp_router_route_mk_entry_flags (uint8_t rtype, int table_id, uint8_t rproto)
+fib_entry_flag_t
+lcp_router_route_mk_entry_flags (u8 rtype, int table_id, u8 rproto)
 {
   fib_entry_flag_t fef = FIB_ENTRY_FLAG_NONE;
 
@@ -1436,6 +1428,9 @@ lcp_router_route_add (struct rtnl_route *rr, int is_replace)
 	  else
 	    fib_table_entry_path_add2 (nlt->nlt_fib_index, &pfx, fib_src,
 				       entry_flags, np.paths);
+
+	  if (is_replace && pfx.fp_proto != FIB_PROTOCOL_MPLS)
+	    lcp_router_srv6_route_replaced (table_id, &pfx);
 	}
     }
   else

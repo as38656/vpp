@@ -331,6 +331,45 @@ nl_route_dispatch (struct nl_object *obj, void *arg)
     }
 }
 
+/*
+ * libnl fails on routes with a seg6 or seg6local tunnel, so they are parsed
+ * here before libnl sees them. Returns 1 if the message was such a route.
+ */
+static int
+nl_route_srv6_dispatch (struct nl_msg *msg, nl_msg_info_t *msg_info)
+{
+  struct nlmsghdr *nlh = nlmsg_hdr (msg);
+  lcp_nl_srv6_route_t route;
+  u8 *reason = NULL;
+  int is_replace;
+
+  switch (lcp_nl_srv6_route_parse (nlh, &route, &reason))
+    {
+    case LCP_NL_SRV6_PARSE_NOT_SRV6:
+      return 0;
+    case LCP_NL_SRV6_PARSE_OK:
+      if (!lcp_itf_num_pairs ())
+	break;
+      if (nlh->nlmsg_type == RTM_NEWROUTE)
+	{
+	  is_replace = msg_info && (nlh->nlmsg_flags & NLM_F_REPLACE);
+	  FOREACH_VFT_CTX (nvl_rt_srv6_route_add, &route, is_replace);
+	}
+      else
+	FOREACH_VFT (nvl_rt_srv6_route_del, &route);
+      break;
+    case LCP_NL_SRV6_PARSE_UNSUPPORTED:
+    case LCP_NL_SRV6_PARSE_MALFORMED:
+      NL_ERROR ("SRv6 route not synced: %s %U: %v", nlh->nlmsg_type == RTM_NEWROUTE ? "add" : "del",
+		format_fib_prefix, &route.prefix, reason);
+      vec_free (reason);
+      break;
+    }
+
+  lcp_nl_srv6_route_free (&route);
+  return 1;
+}
+
 static int
 nl_route_process_msgs (void)
 {
@@ -343,8 +382,8 @@ nl_route_process_msgs (void)
   /* process a batch of messages. break if we hit our limit */
   vec_foreach (msg_info, nm->nl_msg_queue)
     {
-      if ((err = nl_msg_parse (msg_info->msg, nl_route_dispatch, msg_info)) <
-	  0)
+      if (!nl_route_srv6_dispatch (msg_info->msg, msg_info) &&
+	  (err = nl_msg_parse (msg_info->msg, nl_route_dispatch, msg_info)) < 0)
 	NL_ERROR ("Unable to parse object: %s", nl_geterror (err));
       nlmsg_free (msg_info->msg);
       if (++n_msgs >= nm->batch_size)
@@ -414,7 +453,8 @@ lcp_nl_route_dump_cb (struct nl_msg *msg, void *arg)
 {
   int err;
 
-  if ((err = nl_msg_parse (msg, nl_route_dispatch, NULL)) < 0)
+  if (!nl_route_srv6_dispatch (msg, NULL) &&
+      (err = nl_msg_parse (msg, nl_route_dispatch, NULL)) < 0)
     NL_ERROR ("Unable to parse object: %s", nl_geterror (err));
 
   return NL_OK;
