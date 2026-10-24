@@ -71,7 +71,9 @@ add_vpp_plugin(linux_cp_unittest
 add_vpp_plugin(linux_nl
   SOURCES
   lcp_router.c
+  lcp_router_srv6.c
   lcp_nl.c
+  lcp_nl_srv6.c
 
   LINK_LIBRARIES
   lcp

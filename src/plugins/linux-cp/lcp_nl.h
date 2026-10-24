@@ -10,6 +10,8 @@
 #include <netlink/route/neighbour.h>
 #include <netlink/route/addr.h>
 
+#include <linux-cp/lcp_nl_srv6.h>
+
 typedef void (*nl_rt_link_cb_t) (struct rtnl_link *rl, void *ctx);
 typedef void (*nl_rt_link_sync_cb_t) (void);
 typedef void (*nl_rt_addr_cb_t) (struct rtnl_addr *ra);
@@ -19,6 +21,8 @@ typedef void (*nl_rt_neigh_sync_cb_t) (void);
 typedef void (*nl_rt_route_add_cb_t) (struct rtnl_route *rn, int is_replace);
 typedef void (*nl_rt_route_del_cb_t) (struct rtnl_route *rn);
 typedef void (*nl_rt_route_sync_cb_t) (void);
+typedef void (*nl_rt_srv6_route_add_cb_t) (const lcp_nl_srv6_route_t *route, int is_replace);
+typedef void (*nl_rt_srv6_route_del_cb_t) (const lcp_nl_srv6_route_t *route);
 
 #define NL_RT_COMMON uword is_mp_safe
 
@@ -85,6 +89,20 @@ typedef struct nl_rt_route_sync_t_
   nl_rt_route_sync_cb_t cb;
 } nl_rt_route_sync_t;
 
+typedef struct nl_rt_srv6_route_add_t_
+{
+  NL_RT_COMMON;
+
+  nl_rt_srv6_route_add_cb_t cb;
+} nl_rt_srv6_route_add_t;
+
+typedef struct nl_rt_srv6_route_del_t_
+{
+  NL_RT_COMMON;
+
+  nl_rt_srv6_route_del_cb_t cb;
+} nl_rt_srv6_route_del_t;
+
 #undef NL_RT_COMMON
 
 typedef struct nl_vft_t_
@@ -105,6 +123,9 @@ typedef struct nl_vft_t_
   nl_rt_route_del_t nvl_rt_route_del;
   nl_rt_route_sync_t nvl_rt_route_sync_begin;
   nl_rt_route_sync_t nvl_rt_route_sync_end;
+  /* routes with an SRv6 tunnel, which libnl cannot parse */
+  nl_rt_srv6_route_add_t nvl_rt_srv6_route_add;
+  nl_rt_srv6_route_del_t nvl_rt_srv6_route_del;
 } nl_vft_t;
 
 extern void nl_register_vft (const nl_vft_t *nv);
