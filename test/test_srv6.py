@@ -1400,6 +1400,112 @@ class TestSRv6(VppTestCase):
         # cleanup interfaces
         self.teardown_interfaces()
 
+    def test_SRv6_End_DT46(self):
+        """Test SRv6 End.DT46 behavior."""
+        # pg0 is the IPv6-only source in table 0. pg1 (table 0) and pg2
+        # (table vrf_1) carry IPv4 and IPv6, so a lookup in the wrong
+        # table ends on pg1.
+        vrf_1 = 1
+        VppIpTable(self, vrf_1).add_vpp_config()
+        VppIpTable(self, vrf_1, is_ip6=True).add_vpp_config()
+        self.setup_interfaces(
+            ipv6=[True, True, True],
+            ipv4=[False, True, True],
+            ipv6_table_id=[0, 0, vrf_1],
+            ipv4_table_id=[0, 0, vrf_1],
+        )
+
+        for table_id, intf in ((0, self.pg1), (vrf_1, self.pg2)):
+            VppIpRoute(
+                self,
+                "4.1.1.0",
+                24,
+                [VppRoutePath(intf.remote_ip4, intf.sw_if_index, nh_table_id=table_id)],
+                table_id=table_id,
+            ).add_vpp_config()
+            VppIpRoute(
+                self,
+                "a4::",
+                64,
+                [VppRoutePath(intf.remote_ip6, intf.sw_if_index, nh_table_id=table_id)],
+                table_id=table_id,
+            ).add_vpp_config()
+
+        # sw_if_index carries the table id of the lookup
+        localsid = VppSRv6LocalSID(
+            self,
+            localsid="A3::C4",
+            behavior=SRv6LocalSIDBehaviors.SR_BEHAVIOR_DT46,
+            nh_addr=0,
+            end_psp=0,
+            sw_if_index=vrf_1,
+            fib_table=0,
+        )
+        localsid.add_vpp_config()
+        self.addCleanup(localsid.remove_vpp_config)
+        self.logger.debug(self.vapi.cli("show sr localsid"))
+        self.assertIn("DT46", self.vapi.cli("show sr localsid"))
+
+        count = len(self.pg_packet_sizes)
+
+        # IPv4 inside, with SRH (SL=0) and without SRH
+        pkts = []
+        for packet_header in (
+            self.create_packet_header_IPv6_SRH_IPv4(
+                "4.1.1.123", sidlist=["a3::c4", "a2::", "a1::"], segleft=0
+            ),
+            self.create_packet_header_IPv6_IPv4("4.1.1.123", dst_outer="a3::c4"),
+        ):
+            pkts.extend(
+                self.create_stream(
+                    self.pg0, self.pg2, packet_header, self.pg_packet_sizes, count
+                )
+            )
+        self.send_and_verify_pkts(
+            self.pg0, pkts, self.pg2, self.compare_rx_tx_packet_End_DX4
+        )
+        self.pg1.assert_nothing_captured(remark="mis-directed packet(s)")
+
+        # IPv6 inside, with SRH (SL=0) and without SRH
+        self.reset_packet_infos()
+        pkts = []
+        for packet_header in (
+            self.create_packet_header_IPv6_SRH_IPv6(
+                "a4::1234", sidlist=["a3::c4", "a2::", "a1::"], segleft=0
+            ),
+            self.create_packet_header_IPv6_IPv6("a4::1234", dst_outer="a3::c4"),
+        ):
+            pkts.extend(
+                self.create_stream(
+                    self.pg0, self.pg2, packet_header, self.pg_packet_sizes, count
+                )
+            )
+        self.send_and_verify_pkts(
+            self.pg0, pkts, self.pg2, self.compare_rx_tx_packet_End_DX6
+        )
+        self.pg1.assert_nothing_captured(remark="mis-directed packet(s)")
+
+        self.logger.info(self.vapi.cli("show sr localsid"))
+
+    def test_SRv6_End_DT46_needs_both_tables(self):
+        """Test SRv6 End.DT46 is refused when a lookup table is missing."""
+        vrf_1 = 1
+        # only the IPv6 table exists
+        VppIpTable(self, vrf_1, is_ip6=True).add_vpp_config()
+
+        localsid = VppSRv6LocalSID(
+            self,
+            localsid="A3::C4",
+            behavior=SRv6LocalSIDBehaviors.SR_BEHAVIOR_DT46,
+            nh_addr=0,
+            end_psp=0,
+            sw_if_index=vrf_1,
+            fib_table=0,
+        )
+        with self.vapi.assert_negative_api_retval():
+            localsid.add_vpp_config()
+        self.assertNotIn("a3::c4", self.vapi.cli("show sr localsid"))
+
     def test_SRv6_End_DX2(self):
         """Test SRv6 End.DX2 behavior."""
         # send traffic to one destination interface

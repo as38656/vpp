@@ -24,6 +24,7 @@ class SRv6LocalSIDBehaviors:
     SR_BEHAVIOR_END_UN_PERF = 11
     SR_BEHAVIOR_END_UN = 12
     SR_BEHAVIOR_END_UA = 13
+    SR_BEHAVIOR_DT46 = 14
 
 
 class SRv6PolicyType:
