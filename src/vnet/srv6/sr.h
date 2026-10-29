@@ -17,6 +17,7 @@
 #include <vnet/ip/ip6_packet.h>
 #include <vnet/ethernet/ethernet.h>
 #include <vnet/l2/feat_bitmap.h>
+#include <vnet/fib/fib_node.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -82,12 +83,29 @@ typedef struct
 
   u32 egress_fib_table; /**< Egress FIB table for encap packet */
 
+  /** Largest inner packet that fits the path MTU after encaps.
+      ~0 when there is no limit */
+  u32 inner_mtu;
+
   dpo_id_t bsid_dpo;				/**< DPO for Encaps/Insert for BSID */
   dpo_id_t ip6_dpo;				/**< DPO for Encaps/Insert IPv6 */
   dpo_id_t ip4_dpo;				/**< DPO for Encaps IPv6 */
 
   u16 plugin;
   void *plugin_mem;
+
+  /* Path MTU of encaps segment lists, see sr_path_mtu.c */
+
+  /** Child of the FIB entry of the first segment */
+  fib_node_t pmtu_node;
+  /** FIB entry of the first segment. FIB_NODE_INDEX_INVALID when the
+      segment list does not follow it */
+  fib_node_index_t pmtu_fib_entry;
+  /** Index in the children of the FIB entry */
+  u32 pmtu_sibling;
+  /** MTU of the path to the first segment. 0 when the path MTU is not
+      known or not checked */
+  u16 path_mtu;
 } ip6_sr_sl_t;
 
 /* SR policy types */
@@ -378,6 +396,25 @@ extern ip6_address_t *sr_get_encaps_source ();
 
 extern void sr_set_hop_limit (u8 hop_limit);
 extern u8 sr_get_hop_limit (void);
+
+/**
+ * @brief Follow the MTU of the path to the first segment of a segment list
+ *
+ * The segment list keeps path_mtu and inner_mtu up to date until
+ * sr_sl_path_mtu_untrack () is called.
+ *
+ * @param sl is an encaps segment list with its rewrite and egress table set
+ */
+extern void sr_sl_path_mtu_track (ip6_sr_sl_t *sl);
+
+/**
+ * @brief Stop following the path MTU of a segment list
+ *
+ * Does nothing when the segment list does not follow it.
+ */
+extern void sr_sl_path_mtu_untrack (ip6_sr_sl_t *sl);
+
+extern format_function_t format_sr_sl_path_mtu;
 
 /**
  * @brief SR rewrite string computation for SRH insertion (inline)

@@ -739,6 +739,7 @@ list(APPEND VNET_SOURCES
   srv6/sr.c
   srv6/sr_localsid.c
   srv6/sr_policy_rewrite.c
+  srv6/sr_path_mtu.c
   srv6/sr_steering.c
   srv6/sr_api.c
   srv6/sr_pt.c
