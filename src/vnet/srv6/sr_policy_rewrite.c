@@ -32,6 +32,9 @@
 #include <vnet/srv6/sr.h>
 #include <vnet/ip/ip4_inlines.h>
 #include <vnet/ip/ip6_inlines.h>
+#include <vnet/ip/icmp4.h>
+#include <vnet/ip/icmp6.h>
+#include <vnet/ip/ip_frag.h>
 #include <vnet/srv6/sr_packet.h>
 #include <vnet/fib/ip6_fib.h>
 #include <vnet/dpo/dpo.h>
@@ -53,9 +56,12 @@ typedef struct
 } sr_policy_rewrite_trace_t;
 
 /* Graph arcs */
-#define foreach_sr_policy_rewrite_next     \
-_(IP6_LOOKUP, "ip6-lookup")         \
-_(ERROR, "error-drop")
+#define foreach_sr_policy_rewrite_next                                                             \
+  _ (IP6_LOOKUP, "ip6-lookup")                                                                     \
+  _ (ERROR, "error-drop")                                                                          \
+  _ (IP6_ICMP_ERROR, "ip6-icmp-error")                                                             \
+  _ (IP4_ICMP_ERROR, "ip4-icmp-error")                                                             \
+  _ (IP4_FRAG, "ip4-frag")
 
 typedef enum
 {
@@ -66,13 +72,15 @@ typedef enum
 } sr_policy_rewrite_next_t;
 
 /* SR rewrite errors */
-#define foreach_sr_policy_rewrite_error                     \
-_(INTERNAL_ERROR, "Segment Routing undefined error")        \
-_(BSID_ZERO, "BSID with SL = 0")                            \
-_(COUNTER_TOTAL, "SR steered IPv6 packets")                 \
-_(COUNTER_ENCAP, "SR: Encaps packets")                      \
-_(COUNTER_INSERT, "SR: SRH inserted packets")               \
-_(COUNTER_BSID, "SR: BindingSID steered packets")
+#define foreach_sr_policy_rewrite_error                                                            \
+  _ (INTERNAL_ERROR, "Segment Routing undefined error")                                            \
+  _ (BSID_ZERO, "BSID with SL = 0")                                                                \
+  _ (COUNTER_TOTAL, "SR steered IPv6 packets")                                                     \
+  _ (COUNTER_ENCAP, "SR: Encaps packets")                                                          \
+  _ (COUNTER_INSERT, "SR: SRH inserted packets")                                                   \
+  _ (COUNTER_BSID, "SR: BindingSID steered packets")                                               \
+  _ (PACKET_TOO_BIG, "SR: packets too big, ICMP error sent")                                       \
+  _ (FRAGMENTED, "SR: packets fragmented before encaps")
 
 typedef enum
 {
@@ -95,6 +103,11 @@ static dpo_type_t sr_pr_encaps_dpo_type;
 static dpo_type_t sr_pr_insert_dpo_type;
 static dpo_type_t sr_pr_bsid_encaps_dpo_type;
 static dpo_type_t sr_pr_bsid_insert_dpo_type;
+
+/**
+ * @brief Next index of ip4-frag to sr-pl-rewrite-encaps-v4
+ */
+static u32 sr_pr_ip4_frag_next_encaps_v4;
 
 /**
  * @brief IPv6 SA for encapsulated packets
@@ -375,6 +388,8 @@ create_sl (ip6_sr_policy_t *sr_policy, ip6_address_t *sl,
 
   pool_get (sm->sid_lists, segment_list);
   clib_memset (segment_list, 0, sizeof (*segment_list));
+  segment_list->inner_mtu = ~0;
+  segment_list->pmtu_fib_entry = FIB_NODE_INDEX_INVALID;
 
   vec_add1 (sr_policy->segments_lists, segment_list - sm->sid_lists);
 
@@ -404,6 +419,10 @@ create_sl (ip6_sr_policy_t *sr_policy, ip6_address_t *sl,
       segment_list->rewrite = compute_rewrite_insert (sl, sr_policy->type);
       segment_list->rewrite_bsid = compute_rewrite_bsid (sl);
     }
+
+  /* Plugin policies have their own nodes, which do not check the MTU */
+  if (is_encap && !sr_policy->plugin)
+    sr_sl_path_mtu_track (segment_list);
 
   if (sr_policy->plugin)
     {
@@ -462,6 +481,28 @@ create_sl (ip6_sr_policy_t *sr_policy, ip6_address_t *sl,
     }
 
   return segment_list;
+}
+
+/**
+ * @brief Frees a Segment List of an SR policy
+ *
+ * The caller removes the index from the segment lists of the SR policy.
+ *
+ * @param sr_policy is the SR policy of the SL
+ * @param sl_index is the index of the SL
+ */
+static void
+destroy_sl (ip6_sr_policy_t *sr_policy, u32 sl_index)
+{
+  ip6_sr_main_t *sm = &sr_main;
+  ip6_sr_sl_t *segment_list = pool_elt_at_index (sm->sid_lists, sl_index);
+
+  sr_sl_path_mtu_untrack (segment_list);
+  vec_free (segment_list->segments);
+  vec_free (segment_list->rewrite);
+  if (!sr_policy->is_encap)
+    vec_free (segment_list->rewrite_bsid);
+  pool_put_index (sm->sid_lists, sl_index);
 }
 
 /**
@@ -760,7 +801,6 @@ sr_policy_del (ip6_address_t * bsid, u32 index)
 {
   ip6_sr_main_t *sm = &sr_main;
   ip6_sr_policy_t *sr_policy = 0;
-  ip6_sr_sl_t *segment_list;
   u32 *sl_index;
   uword *p;
 
@@ -805,14 +845,7 @@ sr_policy_del (ip6_address_t * bsid, u32 index)
 
   /* Clean SID Lists */
   vec_foreach (sl_index, sr_policy->segments_lists)
-  {
-    segment_list = pool_elt_at_index (sm->sid_lists, *sl_index);
-    vec_free (segment_list->segments);
-    vec_free (segment_list->rewrite);
-    if (!sr_policy->is_encap)
-      vec_free (segment_list->rewrite_bsid);
-    pool_put_index (sm->sid_lists, *sl_index);
-  }
+    destroy_sl (sr_policy, *sl_index);
 
   if (sr_policy->plugin)
     {
@@ -913,12 +946,7 @@ sr_policy_mod (ip6_address_t *bsid, u32 index, u32 fib_table, u8 operation,
 	return -22;
 
       /* Remove the lucky SR list that is being kicked out */
-      segment_list = pool_elt_at_index (sm->sid_lists, sl_index);
-      vec_free (segment_list->segments);
-      vec_free (segment_list->rewrite);
-      if (!sr_policy->is_encap)
-	vec_free (segment_list->rewrite_bsid);
-      pool_put_index (sm->sid_lists, sl_index);
+      destroy_sl (sr_policy, sl_index);
       vec_del1 (sr_policy->segments_lists,
 		sl_index_iterate - sr_policy->segments_lists);
 
@@ -1203,6 +1231,8 @@ show_sr_policies_command_fn (vlib_main_t * vm, unformat_input_t * input,
       }
       s = format (s, "\b\b > ");
       s = format (s, "weight: %u", segment_list->weight);
+      if (FIB_NODE_INDEX_INVALID != segment_list->pmtu_fib_entry)
+	s = format (s, ", %U", format_sr_sl_path_mtu, segment_list);
       vlib_cli_output (vm, "  %v", s);
     }
     vlib_cli_output (vm, "-----------");
@@ -1332,6 +1362,77 @@ encaps_processing_v6 (vlib_node_runtime_t *node, vlib_buffer_t *b0,
 }
 
 /**
+ * @brief Length of an inner IPv6 packet on the wire
+ *
+ * Like ip6-rewrite, use the segment size of a GSO packet.
+ */
+static_always_inline u32
+encaps_inner_length_v6 (vlib_buffer_t *b0, ip6_header_t *ip0_encap)
+{
+  if (PREDICT_FALSE (b0->flags & VNET_BUFFER_F_GSO))
+    return gso_mtu_sz (b0);
+
+  return clib_net_to_host_u16 (ip0_encap->payload_length) + sizeof (ip6_header_t);
+}
+
+/**
+ * @brief Send an IPv6 packet that does not fit the path MTU to ICMP
+ *
+ * This node has not changed sw_if_index[VLIB_TX] yet, so ip6-icmp-error
+ * looks up the source in the table that steered the packet. It sends the
+ * error from an address of the receive interface.
+ *
+ * @return next node index
+ */
+static_always_inline u32
+encaps_too_big_v6 (vlib_node_runtime_t *node, vlib_buffer_t *b0, const ip6_sr_sl_t *sl0)
+{
+  icmp6_error_set_vnet_buffer (b0, ICMP6_packet_too_big, 0, sl0->inner_mtu);
+  b0->error = node->errors[SR_POLICY_REWRITE_ERROR_PACKET_TOO_BIG];
+
+  return SR_POLICY_REWRITE_NEXT_IP6_ICMP_ERROR;
+}
+
+/**
+ * @brief Encapsulate one IPv6 packet, or send it to ICMP when it is too big
+ *
+ * @return next node index
+ */
+static_always_inline u32
+encaps_one_v6 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_buffer_t *b0,
+	       const ip6_sr_sl_t *sl0)
+{
+  ip6_header_t *ip0, *ip0_encap;
+
+  ASSERT (b0->current_data + VLIB_BUFFER_PRE_DATA_SIZE >= vec_len (sl0->rewrite));
+
+  ip0_encap = vlib_buffer_get_current (b0);
+
+  if (PREDICT_FALSE (encaps_inner_length_v6 (b0, ip0_encap) > sl0->inner_mtu))
+    return encaps_too_big_v6 (node, b0, sl0);
+
+  clib_memcpy_fast (((u8 *) ip0_encap) - vec_len (sl0->rewrite), sl0->rewrite,
+		    vec_len (sl0->rewrite));
+  vlib_buffer_advance (b0, -(word) vec_len (sl0->rewrite));
+
+  ip0 = vlib_buffer_get_current (b0);
+
+  encaps_processing_v6 (node, b0, ip0, ip0_encap, sl0->policy_type);
+
+  vnet_buffer (b0)->sw_if_index[VLIB_TX] = sl0->egress_fib_table;
+
+  if (PREDICT_FALSE (node->flags & VLIB_NODE_FLAG_TRACE) &&
+      PREDICT_FALSE (b0->flags & VLIB_BUFFER_IS_TRACED))
+    {
+      sr_policy_rewrite_trace_t *tr = vlib_add_trace (vm, node, b0, sizeof (*tr));
+      clib_memcpy_fast (tr->src.as_u8, ip0->src_address.as_u8, sizeof (tr->src.as_u8));
+      clib_memcpy_fast (tr->dst.as_u8, ip0->dst_address.as_u8, sizeof (tr->dst.as_u8));
+    }
+
+  return SR_POLICY_REWRITE_NEXT_IP6_LOOKUP;
+}
+
+/**
  * @brief Graph node for applying a SR policy into an IPv6 packet. Encapsulation
  */
 static uword
@@ -1427,6 +1528,25 @@ sr_policy_rewrite_encaps (vlib_main_t * vm, vlib_node_runtime_t * node,
 	  ip2_encap = vlib_buffer_get_current (b2);
 	  ip3_encap = vlib_buffer_get_current (b3);
 
+	  if (PREDICT_FALSE ((encaps_inner_length_v6 (b0, ip0_encap) > sl0->inner_mtu) |
+			     (encaps_inner_length_v6 (b1, ip1_encap) > sl1->inner_mtu) |
+			     (encaps_inner_length_v6 (b2, ip2_encap) > sl2->inner_mtu) |
+			     (encaps_inner_length_v6 (b3, ip3_encap) > sl3->inner_mtu)))
+	    {
+	      next0 = encaps_one_v6 (vm, node, b0, sl0);
+	      next1 = encaps_one_v6 (vm, node, b1, sl1);
+	      next2 = encaps_one_v6 (vm, node, b2, sl2);
+	      next3 = encaps_one_v6 (vm, node, b3, sl3);
+
+	      encap_pkts += (next0 == SR_POLICY_REWRITE_NEXT_IP6_LOOKUP) +
+			    (next1 == SR_POLICY_REWRITE_NEXT_IP6_LOOKUP) +
+			    (next2 == SR_POLICY_REWRITE_NEXT_IP6_LOOKUP) +
+			    (next3 == SR_POLICY_REWRITE_NEXT_IP6_LOOKUP);
+	      vlib_validate_buffer_enqueue_x4 (vm, node, next_index, to_next, n_left_to_next, bi0,
+					       bi1, bi2, bi3, next0, next1, next2, next3);
+	      continue;
+	    }
+
 	  clib_memcpy_fast (((u8 *) ip0_encap) - vec_len (sl0->rewrite),
 			    sl0->rewrite, vec_len (sl0->rewrite));
 	  clib_memcpy_fast (((u8 *) ip1_encap) - vec_len (sl1->rewrite),
@@ -1510,9 +1630,8 @@ sr_policy_rewrite_encaps (vlib_main_t * vm, vlib_node_runtime_t * node,
 	{
 	  u32 bi0;
 	  vlib_buffer_t *b0;
-	  ip6_header_t *ip0 = 0, *ip0_encap = 0;
 	  ip6_sr_sl_t *sl0;
-	  u32 next0 = SR_POLICY_REWRITE_NEXT_IP6_LOOKUP;
+	  u32 next0;
 
 	  bi0 = from[0];
 	  to_next[0] = bi0;
@@ -1525,33 +1644,10 @@ sr_policy_rewrite_encaps (vlib_main_t * vm, vlib_node_runtime_t * node,
 	  sl0 =
 	    pool_elt_at_index (sm->sid_lists,
 			       vnet_buffer (b0)->ip.adj_index[VLIB_TX]);
-	  ASSERT (b0->current_data + VLIB_BUFFER_PRE_DATA_SIZE >=
-		  vec_len (sl0->rewrite));
 
-	  ip0_encap = vlib_buffer_get_current (b0);
+	  next0 = encaps_one_v6 (vm, node, b0, sl0);
 
-	  clib_memcpy_fast (((u8 *) ip0_encap) - vec_len (sl0->rewrite),
-			    sl0->rewrite, vec_len (sl0->rewrite));
-	  vlib_buffer_advance (b0, -(word) vec_len (sl0->rewrite));
-
-	  ip0 = vlib_buffer_get_current (b0);
-
-	  encaps_processing_v6 (node, b0, ip0, ip0_encap, sl0->policy_type);
-
-	  vnet_buffer (b0)->sw_if_index[VLIB_TX] = sl0->egress_fib_table;
-
-	  if (PREDICT_FALSE (node->flags & VLIB_NODE_FLAG_TRACE) &&
-	      PREDICT_FALSE (b0->flags & VLIB_BUFFER_IS_TRACED))
-	    {
-	      sr_policy_rewrite_trace_t *tr =
-		vlib_add_trace (vm, node, b0, sizeof (*tr));
-	      clib_memcpy_fast (tr->src.as_u8, ip0->src_address.as_u8,
-				sizeof (tr->src.as_u8));
-	      clib_memcpy_fast (tr->dst.as_u8, ip0->dst_address.as_u8,
-				sizeof (tr->dst.as_u8));
-	    }
-
-	  encap_pkts++;
+	  encap_pkts += next0 == SR_POLICY_REWRITE_NEXT_IP6_LOOKUP;
 	  vlib_validate_buffer_enqueue_x1 (vm, node, next_index, to_next,
 					   n_left_to_next, bi0, next0);
 	}
@@ -1623,6 +1719,94 @@ encaps_processing_v4 (vlib_node_runtime_t * node,
 }
 
 /**
+ * @brief Length of an inner IPv4 packet on the wire
+ *
+ * Like ip4-rewrite, use the segment size of a GSO packet.
+ */
+static_always_inline u32
+encaps_inner_length_v4 (vlib_buffer_t *b0, ip4_header_t *ip0_encap)
+{
+  if (PREDICT_FALSE (b0->flags & VNET_BUFFER_F_GSO))
+    return gso_mtu_sz (b0);
+
+  return clib_net_to_host_u16 (ip0_encap->length);
+}
+
+/**
+ * @brief Handle an IPv4 packet that does not fit the path MTU
+ *
+ * With DF the packet goes to ICMP. This node has not changed
+ * sw_if_index[VLIB_TX] yet, so ip4-icmp-error looks up the source in the
+ * table that steered the packet. It sends the error from an address of the
+ * receive interface.
+ *
+ * Without DF ip4-frag fragments the packet. It keeps adj_index[VLIB_TX] in
+ * the fragments and sends them back to this node, so they use the same
+ * segment list.
+ *
+ * @return next node index
+ */
+static_always_inline u32
+encaps_too_big_v4 (vlib_node_runtime_t *node, vlib_buffer_t *b0, ip4_header_t *ip0_encap,
+		   const ip6_sr_sl_t *sl0)
+{
+  if (ip0_encap->flags_and_fragment_offset & clib_host_to_net_u16 (IP4_HEADER_FLAG_DONT_FRAGMENT))
+    {
+      icmp4_error_set_vnet_buffer (
+	b0, ICMP4_destination_unreachable,
+	ICMP4_destination_unreachable_fragmentation_needed_and_dont_fragment_set, sl0->inner_mtu);
+      b0->error = node->errors[SR_POLICY_REWRITE_ERROR_PACKET_TOO_BIG];
+
+      return SR_POLICY_REWRITE_NEXT_IP4_ICMP_ERROR;
+    }
+
+  ip_frag_set_vnet_buffer (b0, sl0->inner_mtu, sr_pr_ip4_frag_next_encaps_v4, 0);
+
+  return SR_POLICY_REWRITE_NEXT_IP4_FRAG;
+}
+
+/**
+ * @brief Encapsulate one IPv4 packet, or fragment it or send it to ICMP when
+ * it is too big
+ *
+ * @return next node index
+ */
+static_always_inline u32
+encaps_one_v4 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_buffer_t *b0,
+	       const ip6_sr_sl_t *sl0)
+{
+  ip6_header_t *ip0;
+  ip4_header_t *ip0_encap;
+
+  ASSERT (b0->current_data + VLIB_BUFFER_PRE_DATA_SIZE >= vec_len (sl0->rewrite));
+
+  ip0_encap = vlib_buffer_get_current (b0);
+
+  if (PREDICT_FALSE (encaps_inner_length_v4 (b0, ip0_encap) > sl0->inner_mtu))
+    return encaps_too_big_v4 (node, b0, ip0_encap, sl0);
+
+  clib_memcpy_fast (((u8 *) ip0_encap) - vec_len (sl0->rewrite), sl0->rewrite,
+		    vec_len (sl0->rewrite));
+  vlib_buffer_advance (b0, -(word) vec_len (sl0->rewrite));
+
+  ip0 = vlib_buffer_get_current (b0);
+
+  encaps_processing_v4 (node, b0, ip0, ip0_encap);
+
+  vnet_buffer (b0)->sw_if_index[VLIB_TX] = sl0->egress_fib_table;
+
+  if (PREDICT_FALSE (node->flags & VLIB_NODE_FLAG_TRACE) &&
+      PREDICT_FALSE (b0->flags & VLIB_BUFFER_IS_TRACED))
+    {
+      sr_policy_rewrite_trace_t *tr = vlib_add_trace (vm, node, b0, sizeof (*tr));
+      clib_memcpy_fast (tr->src.as_u8, ip0->src_address.as_u8, sizeof (tr->src.as_u8));
+      clib_memcpy_fast (tr->dst.as_u8, ip0->dst_address.as_u8, sizeof (tr->dst.as_u8));
+    }
+
+  return SR_POLICY_REWRITE_NEXT_IP6_LOOKUP;
+}
+
+/**
  * @brief Graph node for applying a SR policy into an IPv4 packet. Encapsulation
  */
 static uword
@@ -1637,7 +1821,7 @@ sr_policy_rewrite_encaps_v4 (vlib_main_t * vm, vlib_node_runtime_t * node,
 
   next_index = node->cached_next_index;
 
-  int encap_pkts = 0, bsid_pkts = 0;
+  int encap_pkts = 0, bsid_pkts = 0, frag_pkts = 0;
 
   while (n_left_from > 0)
     {
@@ -1716,6 +1900,29 @@ sr_policy_rewrite_encaps_v4 (vlib_main_t * vm, vlib_node_runtime_t * node,
 	  ip1_encap = vlib_buffer_get_current (b1);
 	  ip2_encap = vlib_buffer_get_current (b2);
 	  ip3_encap = vlib_buffer_get_current (b3);
+
+	  if (PREDICT_FALSE ((encaps_inner_length_v4 (b0, ip0_encap) > sl0->inner_mtu) |
+			     (encaps_inner_length_v4 (b1, ip1_encap) > sl1->inner_mtu) |
+			     (encaps_inner_length_v4 (b2, ip2_encap) > sl2->inner_mtu) |
+			     (encaps_inner_length_v4 (b3, ip3_encap) > sl3->inner_mtu)))
+	    {
+	      next0 = encaps_one_v4 (vm, node, b0, sl0);
+	      next1 = encaps_one_v4 (vm, node, b1, sl1);
+	      next2 = encaps_one_v4 (vm, node, b2, sl2);
+	      next3 = encaps_one_v4 (vm, node, b3, sl3);
+
+	      encap_pkts += (next0 == SR_POLICY_REWRITE_NEXT_IP6_LOOKUP) +
+			    (next1 == SR_POLICY_REWRITE_NEXT_IP6_LOOKUP) +
+			    (next2 == SR_POLICY_REWRITE_NEXT_IP6_LOOKUP) +
+			    (next3 == SR_POLICY_REWRITE_NEXT_IP6_LOOKUP);
+	      frag_pkts += (next0 == SR_POLICY_REWRITE_NEXT_IP4_FRAG) +
+			   (next1 == SR_POLICY_REWRITE_NEXT_IP4_FRAG) +
+			   (next2 == SR_POLICY_REWRITE_NEXT_IP4_FRAG) +
+			   (next3 == SR_POLICY_REWRITE_NEXT_IP4_FRAG);
+	      vlib_validate_buffer_enqueue_x4 (vm, node, next_index, to_next, n_left_to_next, bi0,
+					       bi1, bi2, bi3, next0, next1, next2, next3);
+	      continue;
+	    }
 
 	  clib_memcpy_fast (((u8 *) ip0_encap) - vec_len (sl0->rewrite),
 			    sl0->rewrite, vec_len (sl0->rewrite));
@@ -1800,10 +2007,8 @@ sr_policy_rewrite_encaps_v4 (vlib_main_t * vm, vlib_node_runtime_t * node,
 	{
 	  u32 bi0;
 	  vlib_buffer_t *b0;
-	  ip6_header_t *ip0 = 0;
-	  ip4_header_t *ip0_encap = 0;
 	  ip6_sr_sl_t *sl0;
-	  u32 next0 = SR_POLICY_REWRITE_NEXT_IP6_LOOKUP;
+	  u32 next0;
 
 	  bi0 = from[0];
 	  to_next[0] = bi0;
@@ -1816,33 +2021,11 @@ sr_policy_rewrite_encaps_v4 (vlib_main_t * vm, vlib_node_runtime_t * node,
 	  sl0 =
 	    pool_elt_at_index (sm->sid_lists,
 			       vnet_buffer (b0)->ip.adj_index[VLIB_TX]);
-	  ASSERT (b0->current_data + VLIB_BUFFER_PRE_DATA_SIZE >=
-		  vec_len (sl0->rewrite));
 
-	  ip0_encap = vlib_buffer_get_current (b0);
+	  next0 = encaps_one_v4 (vm, node, b0, sl0);
 
-	  clib_memcpy_fast (((u8 *) ip0_encap) - vec_len (sl0->rewrite),
-			    sl0->rewrite, vec_len (sl0->rewrite));
-	  vlib_buffer_advance (b0, -(word) vec_len (sl0->rewrite));
-
-	  ip0 = vlib_buffer_get_current (b0);
-
-	  encaps_processing_v4 (node, b0, ip0, ip0_encap);
-
-	  vnet_buffer (b0)->sw_if_index[VLIB_TX] = sl0->egress_fib_table;
-
-	  if (PREDICT_FALSE (node->flags & VLIB_NODE_FLAG_TRACE) &&
-	      PREDICT_FALSE (b0->flags & VLIB_BUFFER_IS_TRACED))
-	    {
-	      sr_policy_rewrite_trace_t *tr =
-		vlib_add_trace (vm, node, b0, sizeof (*tr));
-	      clib_memcpy_fast (tr->src.as_u8, ip0->src_address.as_u8,
-				sizeof (tr->src.as_u8));
-	      clib_memcpy_fast (tr->dst.as_u8, ip0->dst_address.as_u8,
-				sizeof (tr->dst.as_u8));
-	    }
-
-	  encap_pkts++;
+	  encap_pkts += next0 == SR_POLICY_REWRITE_NEXT_IP6_LOOKUP;
+	  frag_pkts += next0 == SR_POLICY_REWRITE_NEXT_IP4_FRAG;
 	  vlib_validate_buffer_enqueue_x1 (vm, node, next_index, to_next,
 					   n_left_to_next, bi0, next0);
 	}
@@ -1857,6 +2040,7 @@ sr_policy_rewrite_encaps_v4 (vlib_main_t * vm, vlib_node_runtime_t * node,
   vlib_node_increment_counter (vm, sr_policy_rewrite_encaps_node.index,
 			       SR_POLICY_REWRITE_ERROR_COUNTER_BSID,
 			       bsid_pkts);
+  vlib_node_increment_counter (vm, node->node_index, SR_POLICY_REWRITE_ERROR_FRAGMENTED, frag_pkts);
 
   return from_frame->n_vectors;
 }
@@ -3640,6 +3824,9 @@ sr_policy_rewrite_init (vlib_main_t * vm)
 
   sr_pr_bsid_insert_dpo_type =
     dpo_register_new_type (&sr_policy_rewrite_vft, sr_pr_bsid_insert_nodes);
+
+  sr_pr_ip4_frag_next_encaps_v4 =
+    vlib_node_add_next (vm, ip4_frag_node.index, sr_policy_rewrite_encaps_v4_node.index);
 
   /* Register the L2 encaps node used in HW redirect */
   sm->l2_sr_policy_rewrite_index = sr_policy_rewrite_encaps_node.index;

@@ -94,3 +94,37 @@ command:
 ::
 
    set sr encaps hop-limit N
+
+Path MTU of encapsulation policies
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Each segment list follows the MTU of the path to its first segment in
+the egress table: the smallest IPv6 MTU of the interfaces that the route
+to the first segment uses. The value changes when the route or the MTU
+of such an interface changes. The inner MTU is the path MTU minus the
+length of the encapsulation (the IPv6 header, and the SRH when there is
+one).
+
+Before encapsulation, the headend checks IPv6 and IPv4 packets against
+the inner MTU. A packet that is larger is handled like this:
+
+-  IPv6: the packet is dropped, and an ICMPv6 Packet Too Big with the
+   inner MTU is sent to its source.
+-  IPv4 with DF: the packet is dropped, and an ICMPv4 Fragmentation
+   Needed with the inner MTU is sent to its source.
+-  IPv4 without DF: the packet is fragmented to the inner MTU, then
+   each fragment is encapsulated.
+
+The ICMP errors are sent from an address of the interface that received
+the packet, and are routed in the table of that interface. There is no
+check when the path MTU is not known (for example when the first segment
+is not reachable) or when it is less than 1280.
+
+The path MTU and the inner MTU of each segment list are shown by:
+
+::
+
+   show sr policies
+
+SRH insertion, L2 encapsulation and packets with the Binding SID as
+destination are not checked.
