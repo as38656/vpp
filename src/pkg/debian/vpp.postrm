@@ -1,5 +1,12 @@
 #!/bin/sh -e
 
+# On an upgrade the NICs stay with VPP. VPP binds only the NICs it knows, so a
+# NIC bound by hand would stay unbound when the new VPP starts.
+case "$1" in
+remove|purge) ;;
+*) exit 0 ;;
+esac
+
 removed=
 
 # Unbind user-mode PCI drivers
