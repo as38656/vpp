@@ -410,10 +410,11 @@ sr_cli_localsid_command_fn (vlib_main_t * vm, unformat_input_t * input,
 	    behavior = SR_BEHAVIOR_DX2;
 	  else if (unformat (input, "end.dt6 %u", &sw_if_index))
 	    behavior = SR_BEHAVIOR_DT6;
-	  else if (unformat (input, "end.dt4 %u", &sw_if_index))
-	    behavior = SR_BEHAVIOR_DT4;
+	  /* "end.dt4 %u" would take "end.dt46 300" as table 6 */
 	  else if (unformat (input, "end.dt46 %u", &sw_if_index))
 	    behavior = SR_BEHAVIOR_DT46;
+	  else if (unformat (input, "end.dt4 %u", &sw_if_index))
+	    behavior = SR_BEHAVIOR_DT4;
 	  else if (unformat (input, "un %u", &usid_size))
 	    behavior = SR_BEHAVIOR_END_UN_PERF;
 	  else if (unformat (input, "un.flex %u", &usid_size))

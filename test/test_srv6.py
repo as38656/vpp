@@ -1487,6 +1487,26 @@ class TestSRv6(VppTestCase):
 
         self.logger.info(self.vapi.cli("show sr localsid"))
 
+    def test_SRv6_End_DT46_cli(self):
+        """Test the CLI creates End.DT46, not End.DT4, for end.dt46."""
+        vrf_1 = 300
+        VppIpTable(self, vrf_1).add_vpp_config()
+        VppIpTable(self, vrf_1, is_ip6=True).add_vpp_config()
+
+        self.vapi.cli("sr localsid address a3::c4 behavior end.dt46 %d" % vrf_1)
+        self.addCleanup(self.vapi.cli, "sr localsid del address a3::c4")
+
+        localsids = [
+            ls
+            for ls in self.vapi.sr_localsids_dump()
+            if str(ls.addr) == "a3::c4"
+        ]
+        self.assertEqual(len(localsids), 1)
+        self.assertEqual(
+            localsids[0].behavior, SRv6LocalSIDBehaviors.SR_BEHAVIOR_DT46
+        )
+        self.assertEqual(localsids[0].xconnect_iface_or_vrf_table, vrf_1)
+
     def test_SRv6_End_DT46_needs_both_tables(self):
         """Test SRv6 End.DT46 is refused when a lookup table is missing."""
         vrf_1 = 1
