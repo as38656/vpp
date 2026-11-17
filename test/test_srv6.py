@@ -1507,6 +1507,28 @@ class TestSRv6(VppTestCase):
         )
         self.assertEqual(localsids[0].xconnect_iface_or_vrf_table, vrf_1)
 
+    def test_SRv6_End_lookup_needs_table(self):
+        """Test End.T, End.DT4 and End.DT6 are refused without their table."""
+        missing = 77
+        for behavior in (
+            SRv6LocalSIDBehaviors.SR_BEHAVIOR_T,
+            SRv6LocalSIDBehaviors.SR_BEHAVIOR_DT4,
+            SRv6LocalSIDBehaviors.SR_BEHAVIOR_DT6,
+        ):
+            localsid = VppSRv6LocalSID(
+                self,
+                localsid="A3::C4",
+                behavior=behavior,
+                nh_addr=0,
+                end_psp=0,
+                sw_if_index=missing,
+                fib_table=0,
+            )
+            with self.vapi.assert_negative_api_retval():
+                localsid.add_vpp_config()
+        # "show sr localsid" read the table of such a local SID and crashed
+        self.assertNotIn("a3::c4", self.vapi.cli("show sr localsid"))
+
     def test_SRv6_End_DT46_needs_both_tables(self):
         """Test SRv6 End.DT46 is refused when a lookup table is missing."""
         vrf_1 = 1

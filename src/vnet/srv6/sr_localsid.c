@@ -38,6 +38,29 @@ static dpo_type_t sr_localsid_d_dpo_type;
 static dpo_type_t sr_localsid_un_dpo_type;
 static dpo_type_t sr_localsid_un_perf_dpo_type;
 
+/**
+ * @brief Whether the tables a lookup behavior uses exist.
+ *
+ * For End.T and End.DT*, sw_if_index carries the table id.
+ */
+static int
+sr_localsid_lookup_tables_exist (u8 behavior, u32 table_id)
+{
+  switch (behavior)
+    {
+    case SR_BEHAVIOR_T:
+    case SR_BEHAVIOR_DT6:
+      return fib_table_find (FIB_PROTOCOL_IP6, table_id) != ~0;
+    case SR_BEHAVIOR_DT4:
+      return fib_table_find (FIB_PROTOCOL_IP4, table_id) != ~0;
+    case SR_BEHAVIOR_DT46:
+      return fib_table_find (FIB_PROTOCOL_IP4, table_id) != ~0 &&
+	     fib_table_find (FIB_PROTOCOL_IP6, table_id) != ~0;
+    default:
+      return 1;
+    }
+}
+
 static void
 sr_localsid_key_create (sr_localsid_key_t * key, ip6_address_t * addr,
 			u16 pref_len)
@@ -170,8 +193,7 @@ sr_cli_localsid (char is_del, ip6_address_t *localsid_addr, u16 localsid_prefix_
   if (FIB_NODE_INDEX_INVALID != fei)
     return -4;			//There is an entry for such address (the localsid addr)
 
-  if (behavior == SR_BEHAVIOR_DT46 && (fib_table_find (FIB_PROTOCOL_IP4, sw_if_index) == ~0 ||
-				       fib_table_find (FIB_PROTOCOL_IP6, sw_if_index) == ~0))
+  if (!sr_localsid_lookup_tables_exist (behavior, sw_if_index))
     return -7;
 
   /* Create a new localsid registry */
